@@ -20,11 +20,14 @@ cudaError_t ercall;
 //*****************************************************************************************************************************************************************************************
 
 // sizes for renderer
-#define num_triangles 36
+#define num_triangles 1
 #define scr_w 512
 #define scr_h 512
 #define max_triangles_per_node 10 // max triangles in each BVH node before divisions stop
 #define node_density 1.0f // nodes per x, y, z of overall bounding box
+
+// constants
+#define fov 0.001
 
 // macros to replace functions
 #define dot(vec3_v1, vec3_v2) (vec3_v1.x * vec3_v2.x + vec3_v1.y * vec3_v2.y + vec3_v1.z * vec3_v2.z)
@@ -240,7 +243,12 @@ void allocGridNodes() {
 
     grid_node* gridNodesCPU = (grid_node*)malloc(numNodesX * numNodesY * numNodesZ * sizeof(grid_node));
 
+    // TODO: change grid_node struct to have a pointer instead of array(or do subdividing nodes)
+    // TODO: !!! add cudaMalloc for each node later on to do dynamic init of num of triangles per node !!!
+
     // because dynamic init isn't supported on GPU, its done CPU
+
+    // 
 }
 
 // global device arrs
@@ -298,6 +306,20 @@ inline __device__ vec3 get_grid_node_intersect(const ray r, const grid_node n) {
     return intersect;
 }
 
+inline __device__ vec3 get_all_triangle_intersect(const ray r) {
+    float closest_dist = 1e20f;
+    vec3 intersect; intersect.null = true;
+
+    for (int t = 0; t < num_triangles; t++) {
+        intersect_pkg it = get_triangle_intersect(r, ((triangle*)triangles)[t]);
+        if (it.dist < closest_dist) {
+            closest_dist = it.dist;
+            intersect = it.intersect;
+        }
+    }
+    return intersect;
+}
+
 inline __device__ float get_specular_intensity(const ray r, const vec3 light_point, const float light_strength, const int spec_pow) {
     const vec3 light_dir = light_point - r.origin;
     return -1 * pow(dot(light_dir, r.direction), spec_pow) * light_strength;
@@ -319,6 +341,10 @@ inline __device__ float get_total_light_intensity(const ray intersect, const vec
     return get_diffuse_intensity(intersect, nv, light_point, light_intensity) + get_specular_intensity(intersect, light_point, light_intensity, 10) + ambient_intensity;
 }
 
+inline __device__ color get_pixel_color_test(const ray r, const float ambient_intensity) {
+    return color(1.0f * get_all_triangle_intersect(r).null, 0.0f, 0.0f);
+}
+
 __global__ void init_triangle(vec3 p1, vec3 p2, vec3 p3, material m, int index) {
     const triangle t = triangle(p1, p2, p3);
     ((triangle*)triangles)[index] = t;
@@ -334,6 +360,19 @@ void initTriangle(vec3 p1, vec3 p2, vec3 p3, material m, int index) {
 }
 
 char cpuColors[scr_w * scr_h * sizeof(color)];
+
+__global__ void fillBufferTest() {
+    const int id = threadIdx.x + blockIdx.x * blockDim.x;
+    const int x = id % scr_w;
+    const int y = id / scr_w;
+    ray r = ray(vec3(x, y, 0.0f), vec3(x * fov, y * fov, 1.0f));
+    ((color*)screen_buffer)[id] = get_pixel_color_test(r, 1.0f);
+}
+
+void fillBufferTestCall() {
+    fillBufferTest << <512, scr_w* scr_h / 512 >> > ();
+    cudaMemcpyFromSymbol(cpuColors, screen_buffer, sizeof(color) * scr_w * scr_h);
+}
 
 //*****************************************************************************************************************************************************************************************
 // opengl stuff
@@ -376,6 +415,9 @@ float truncate(float f) {
 
 int main()
 {
+    // add triangles
+    initTriangle(vec3(0.0f, 0.0f, 1.0f), vec3(100.0f, 0.0f, 1.0f), vec3(100.0f, 100.0f, 1.0f), material(color(1.0f, 0.0f, 0.0f), 1.0f, 1.0f), 0);
+
 
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -474,7 +516,7 @@ int main()
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST_MIPMAP_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, scr_w, scr_h, 0, GL_RGB, GL_UNSIGNED_BYTE, cpuColors);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, scr_w, scr_h, 0, GL_RGB, GL_FLOAT, cpuColors);
 	glGenerateMipmap(GL_TEXTURE_2D);
     glUseProgram(shaderProgram); 
     glUniform1i(glGetUniformLocation(shaderProgram, "texture1"), 0);
@@ -491,8 +533,9 @@ int main()
         int ind = 0;
         // **
         // dodaj boje tu u pixels
+        fillBufferTestCall();
         // **
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, scr_w, scr_h, 0, GL_RGB, GL_UNSIGNED_BYTE, cpuColors);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, scr_w, scr_h, 0, GL_RGB, GL_FLOAT, cpuColors);
 		glGenerateMipmap(GL_TEXTURE_2D);
         // bind textures on corresponding texture units
         glActiveTexture(GL_TEXTURE0);
