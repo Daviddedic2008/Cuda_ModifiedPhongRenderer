@@ -10,6 +10,8 @@
 #include <glad/glad.h>
 #include <glfw3.h>
 #include <string.h>
+#include <fstream>
+#include <sstream>
 
 cudaError_t ercall;
 #define CCALL(call) ercall = call; if(cudaSuccess != ercall){fprintf(stderr, "Cuda error in file '%s' in line %i : %s.\n", __FILE__, __LINE__, cudaGetErrorString(ercall)); exit(EXIT_FAILURE);}
@@ -20,7 +22,7 @@ cudaError_t ercall;
 //*****************************************************************************************************************************************************************************************
 
 // sizes for renderer
-#define num_triangles 1
+#define num_triangles 300
 #define scr_w 512
 #define scr_h 512
 #define max_triangles_per_node 10 // max triangles in each BVH node before divisions stop
@@ -92,6 +94,7 @@ vec3_tmp BVHMin, BVHMax; // global CPU min/max
 struct color {
     float r, g, b;
     __host__ __device__ color(float R, float G, float B) : r(R), g(G), b(B) {}
+    __host__ __device__ color() : r(0), g(0), b(0) {}
 
     inline __host__ __device__ color operator+(const color& f) const {
         return color(r + f.r, g + f.g, b + f.b);
@@ -123,7 +126,7 @@ struct triangle {
     vec3 sb21, sb31;
     float dot2121, dot2131, dot3131;
 
-    __device__ triangle() : p1(vec3(0.0f, 0.0f, 0.0f)), p2(vec3(0.0f, 0.0f, 0.0f)), p3(vec3(0.0f, 0.0f, 0.0f)) {}
+    __host__ __device__ triangle() : p1(vec3(0.0f, 0.0f, 0.0f)), p2(vec3(0.0f, 0.0f, 0.0f)), p3(vec3(0.0f, 0.0f, 0.0f)) {}
 
     __host__ __device__ triangle(vec3 P1, vec3 P2, vec3 P3) {
         p1 = P1;
@@ -306,18 +309,27 @@ inline __device__ vec3 get_grid_node_intersect(const ray r, const grid_node n) {
     return intersect;
 }
 
-inline __device__ vec3 get_all_triangle_intersect(const ray r) {
-    float closest_dist = 1e20f;
-    vec3 intersect; intersect.null = true;
+typedef struct {
+    vec3 intersect, nv;
+    float dist;
+    color c;
+}intersect_pkg_2;
+
+inline __device__ intersect_pkg_2 get_all_triangle_intersect(const ray r) {
+    intersect_pkg_2 ret;
+    ret.dist = 1e20;
 
     for (int t = 0; t < num_triangles; t++) {
-        intersect_pkg it = get_triangle_intersect(r, ((triangle*)triangles)[t]);
-        if (it.dist < closest_dist) {
-            closest_dist = it.dist;
-            intersect = it.intersect;
+        const triangle tmp = ((triangle*)triangles)[t];
+        intersect_pkg it = get_triangle_intersect(r, tmp);
+        if (it.dist < ret.dist) {
+            ret.intersect = it.intersect;
+            ret.c = ((material*)triangle_materials)[t].c;
+            ret.dist = it.dist;
+            ret.nv = tmp.nv;
         }
     }
-    return intersect;
+    return ret;
 }
 
 inline __device__ float get_specular_intensity(const ray r, const vec3 light_point, const float light_strength, const int spec_pow) {
@@ -342,7 +354,12 @@ inline __device__ float get_total_light_intensity(const ray intersect, const vec
 }
 
 inline __device__ color get_pixel_color_test(const ray r, const float ambient_intensity) {
-    return color(1.0f * get_all_triangle_intersect(r).null, 0.0f, 0.0f);
+    return color(1.0f * get_all_triangle_intersect(r).intersect.null, 0.0f, 0.0f);
+}
+
+inline __device__ color get_pixel_color(const ray r, const float ambient_intensity, const float light_intensity, const vec3 light_point) {
+    intersect_pkg_2 r_ret = get_all_triangle_intersect(r);
+    color ret = r_ret.c * get_total_light_intensity(ray(r_ret.intersect, r.direction), r_ret.nv, light_point, light_intensity, ambient_intensity);
 }
 
 __global__ void init_triangle(vec3 p1, vec3 p2, vec3 p3, material m, int index) {
@@ -372,6 +389,99 @@ __global__ void fillBufferTest() {
 void fillBufferTestCall() {
     fillBufferTest << <512, scr_w* scr_h / 512 >> > ();
     cudaMemcpyFromSymbol(cpuColors, screen_buffer, sizeof(color) * scr_w * scr_h);
+}
+
+__global__ void fillBuffer() {
+    const int id = threadIdx.x + blockIdx.x * blockDim.x;
+    const int x = id % scr_w;
+    const int y = id / scr_w;
+    ray r = ray(vec3(x, y, 0.0f), vec3(x * fov, y * fov, 1.0f));
+    ((color*)screen_buffer)[id] = get_pixel_color_test(r, 1.0f);
+}
+
+//*****************************************************************************************************************************************************************************************
+// stl loader
+
+bool read_stl(const std::string& filename, material m, int start_idx) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+
+    file.seekg(80, std::ios::beg);
+
+
+    unsigned int numTriangles;
+    file.read(reinterpret_cast<char*>(&numTriangles), sizeof(numTriangles));
+
+    // Read each triangle
+    for (unsigned int i = 0; i < numTriangles; ++i) {
+        // Skip normal vector (3 floats)
+        float normal[3];
+        file.read(reinterpret_cast<char*>(&normal), sizeof(normal));
+
+        // Read the 3 vertices of the triangle
+        triangle t;
+        file.read(reinterpret_cast<char*>(&t.p1.x), sizeof(float));  // p1.x
+        file.read(reinterpret_cast<char*>(&t.p1.y), sizeof(float));  // p1.y
+        file.read(reinterpret_cast<char*>(&t.p1.z), sizeof(float));  // p1.z
+
+        file.read(reinterpret_cast<char*>(&t.p2.x), sizeof(float));  // p2.x
+        file.read(reinterpret_cast<char*>(&t.p2.y), sizeof(float));  // p2.y
+        file.read(reinterpret_cast<char*>(&t.p2.z), sizeof(float));  // p2.z
+
+        file.read(reinterpret_cast<char*>(&t.p3.x), sizeof(float));  // p3.x
+        file.read(reinterpret_cast<char*>(&t.p3.y), sizeof(float));  // p3.y
+        file.read(reinterpret_cast<char*>(&t.p3.z), sizeof(float));  // p3.z
+
+        // Skip attribute byte count (2 bytes)
+        unsigned short attribute;
+        file.read(reinterpret_cast<char*>(&attribute), sizeof(attribute));
+
+        // Call add_triangle with the triangle and index
+        initTriangle(t.p1, t.p2, t.p3, m, start_idx + i);
+    }
+
+    file.close();
+    return true;
+}
+
+// Function to read an ASCII STL file and add triangles
+bool read_ascii_stl(const std::string& filename, material m, int start_idx) {
+    std::ifstream file(filename);
+    if (!file) {
+        return false;
+    }
+
+    std::string line;
+    int idx = start_idx;
+    while (std::getline(file, line)) {
+        if (line.find("facet normal") != std::string::npos) {
+            // Skip the normal line
+            std::getline(file, line);
+
+            // Read the 3 vertices of the triangle
+            triangle t;
+            for (int i = 0; i < 3; ++i) {
+                std::getline(file, line);
+                std::stringstream ss(line);
+                std::string temp;
+                ss >> temp >> t.p1.x >> t.p1.y >> t.p1.z;
+            }
+
+            // Skip the endfacet line
+            std::getline(file, line);
+
+            // Call add_triangle with the triangle and index
+            initTriangle(t.p1, t.p2, t.p3, m, idx);
+            printf("%f %f %f\n", t.p1.x, t.p1.y, t.p1.z);
+            idx++;
+        }
+    }
+
+    file.close();
+    return true;
 }
 
 //*****************************************************************************************************************************************************************************************
@@ -417,7 +527,6 @@ int main()
 {
     // add triangles
     initTriangle(vec3(0.0f, 0.0f, 1.0f), vec3(100.0f, 0.0f, 1.0f), vec3(100.0f, 100.0f, 1.0f), material(color(1.0f, 0.0f, 0.0f), 1.0f, 1.0f), 0);
-
 
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
