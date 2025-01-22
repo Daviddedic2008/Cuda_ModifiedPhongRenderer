@@ -17,12 +17,13 @@
 #define scr_w 512
 #define scr_h 512
 
-#define num_triangles 1
+#define num_triangles 100
 #define max_streams 512
 
 cudaError_t ercall;
+cudaError_t err;
 #define CCALL(call) ercall = call; if(cudaSuccess != ercall){fprintf(stderr, "Cuda error in file '%s' in line %i : %s.\n", __FILE__, __LINE__, cudaGetErrorString(ercall)); exit(EXIT_FAILURE);}
-#define printLastErrorCUDA() printf(cudaGetErrorString(cudaGetLastError()))
+#define printLastErrorCUDA() err = cudaGetLastError(); if(err != cudaSuccess){printf("%s\n",cudaGetErrorString(err));}
 
 #define dot(vec3_v1, vec3_v2) (vec3_v1.x * vec3_v2.x + vec3_v1.y * vec3_v2.y + vec3_v1.z * vec3_v2.z)
 #define dot2D(vec2_v1, vec2_v2) (vec2_v1.x * vec2_v2.x + vec2_v1.y * vec2_v2.y)
@@ -154,7 +155,7 @@ struct triangle2D {
         calc_denom_and_vals();
     }
 
-    inline __host__ __device__ bool point_in_triangle(const vec2 p) {
+    inline __host__ __device__ bool point_in_triangle(const vec2 p) const {
         const float x3m = p.x - p3.x;
         const float y3m = p.y - p3.y;
 
@@ -216,21 +217,29 @@ __device__ char screen_buffer[sizeof(color) * scr_w * scr_h];
 // global device array of all triangles
 __device__ char triangles[sizeof(triangle) * num_triangles];
 
+__global__ void fillPixels(const int minx, const int maxx, const int miny, const int maxy, color c, triangle2D t2D) {
+    const int id = threadIdx.x + blockIdx.x * blockDim.x;
+
+    const int x = id % (maxx - minx);
+    const int y = id / (maxx - minx);
+
+    if (t2D.point_in_triangle(vec2(x, y))) {
+        ((color*)screen_buffer)[x + y * scr_w] = c;
+    }
+}
+
 // rasterization function tests
-inline __global__ void rasterize_triangles_single_thread(color c) {
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (index >= num_triangles) { return; }
-    triangle2D t2D = ((triangle*)triangles)[index].convert_to_2D();
+__global__ void rasterize_triangles_single_thread(color c) {
+    const int index = threadIdx.x + blockIdx.x * blockDim.x;
+    //if (index >= num_triangles) { return; }
+    const triangle2D t2D = ((triangle*)triangles)[index].convert_to_2D();
 
     const int p_minx = (int)t2D.bound_box.min.x;
     const int p_miny = (int)t2D.bound_box.min.y;
     const int p_maxx = (int)t2D.bound_box.max.x;
     const int p_maxy = (int)t2D.bound_box.max.y;
-    for(int x = p_minx; x <= p_maxx; x++) {
-        for (int y = p_miny; y < p_maxy; y++) {
-            ((color*)screen_buffer)[x + y * scr_w] = c * t2D.point_in_triangle(vec2(x, y));
-        }
-    }
+
+    fillPixels << <512, (p_maxx - p_minx)* (p_maxy - p_miny) / 512 >> > (p_minx, p_maxx, p_miny, p_maxy, c, t2D);
 }
 
 __global__ void rasterize_triangle_multi_thread(int index, color c) {
@@ -253,7 +262,9 @@ __global__ void rasterize_triangle_multi_thread(int index, color c) {
     const int x = id % x_dif + min.x;
     const int y = id / x_dif + min.y;
 
-    ((color*)screen_buffer)[x + y * scr_w] = c * t2D.point_in_triangle(vec2(x, y));
+    if (t2D.point_in_triangle(vec2(x, y))) {
+        ((color*)screen_buffer)[x + y * scr_w] = c;
+    }
 }
 
 int clamp(int i) {
@@ -281,7 +292,7 @@ void rasterize_all_triangles_multi_thread() {
 */
 
 void rasterize_all_triangles(color c) {
-    rasterize_triangles_single_thread << <256, num_triangles / 256 + 1 >> > (c);
+    rasterize_triangles_single_thread << <1024, num_triangles / 1024 + 1 >> > (c);
 }
 
 void add_triangle(vec3 p1, vec3 p2, vec3 p3, int idx) {
@@ -339,7 +350,7 @@ int main()
 {
     // add triangles
     for (int t = 0; t < num_triangles; t++) {
-        add_triangle(vec3(0.0f, 0.0f, 1.0f), vec3(100.0f, 0.0f, 1.0f), vec3(100.0f, 100.0f, 1.0f), t);
+        add_triangle(vec3(0.0f, 0.0f, 1.0f), vec3(100.0f, 0.0f, 1.0f), vec3(100.0f+t, 100.0f, 1.0f), t);
     }
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -440,15 +451,18 @@ int main()
     glUseProgram(shaderProgram); 
     glUniform1i(glGetUniformLocation(shaderProgram, "texture1"), 0);
 
-    clock_t start, end;
+    cudaEvent_t start, end;
+    cudaEventCreate(&start);
+    cudaEventCreate(&end);
     int frametime = 0;
     unsigned int frame = 0;
+    
     while (!glfwWindowShouldClose(window))
     {
-        start = clock();
+        cudaEventRecord(start);
         processInput(window);
         glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        //glClear(GL_COLOR_BUFFER_BIT);
         int ind = 0;
         // **
         // dodaj boje tu u pixels
@@ -468,28 +482,19 @@ int main()
 
         glfwSwapBuffers(window);
         glfwPollEvents();
-        end = clock();
+        cudaDeviceSynchronize();
         if (frame % 10 == 1) {
             int fps = 10000 / (frametime);
-            if (fps < 10) {
-                printf("\rFPS: 000%d", fps);
-            }
-
-            if (fps < 100) {
-                printf("\rFPS: 00%d", fps);
-            }
-
-            else if (fps < 1000) {
-                printf("\rFPS: 0%d", fps);
-            }
-            
-            else {
-                printf("\rFPS: %d", fps);
-            }
+            printf("%d\n", fps);
             frametime = 0;
         }
+        cudaDeviceSynchronize();
+        cudaEventRecord(end);
         frame++;
-        frametime += end - start;
+        float milis;
+        cudaEventElapsedTime(&milis, start, end);
+        frametime += milis;
+        printLastErrorCUDA()
     }
     glDeleteVertexArrays(1, &VAO);
     glDeleteBuffers(1, &VBO);
