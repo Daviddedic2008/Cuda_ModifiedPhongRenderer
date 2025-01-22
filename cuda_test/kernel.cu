@@ -17,7 +17,7 @@
 #define scr_w 512
 #define scr_h 512
 
-#define num_triangles 100
+#define num_triangles 1
 #define max_streams 512
 
 cudaError_t ercall;
@@ -231,7 +231,7 @@ __global__ void fillPixels(const int minx, const int maxx, const int miny, const
 // rasterization function tests
 __global__ void rasterize_triangles_single_thread(color c) {
     const int index = threadIdx.x + blockIdx.x * blockDim.x;
-    //if (index >= num_triangles) { return; }
+    if (index >= num_triangles) { return; }
     const triangle2D t2D = ((triangle*)triangles)[index].convert_to_2D();
 
     const int p_minx = (int)t2D.bound_box.min.x;
@@ -239,7 +239,7 @@ __global__ void rasterize_triangles_single_thread(color c) {
     const int p_maxx = (int)t2D.bound_box.max.x;
     const int p_maxy = (int)t2D.bound_box.max.y;
 
-    fillPixels << <512, (p_maxx - p_minx)* (p_maxy - p_miny) / 512 >> > (p_minx, p_maxx, p_miny, p_maxy, c, t2D);
+    fillPixels << <512, (p_maxx - p_minx) * (p_maxy - p_miny) / 512 >> > (p_minx, p_maxx, p_miny, p_maxy, c, t2D);
 }
 
 __global__ void rasterize_triangle_multi_thread(int index, color c) {
