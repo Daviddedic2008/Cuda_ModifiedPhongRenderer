@@ -13,28 +13,26 @@
 #include <fstream>
 #include <sstream>
 
+#define fov 1.0f
+#define scr_w 512
+#define scr_h 512
+
+#define num_triangles 1
+#define max_streams 512
+
 cudaError_t ercall;
 #define CCALL(call) ercall = call; if(cudaSuccess != ercall){fprintf(stderr, "Cuda error in file '%s' in line %i : %s.\n", __FILE__, __LINE__, cudaGetErrorString(ercall)); exit(EXIT_FAILURE);}
+#define printLastErrorCUDA() printf(cudaGetErrorString(cudaGetLastError()))
 
-//#define DEBUG //if defined, extra stuff is printed(shouldn't slow down program noticeably)
+#define dot(vec3_v1, vec3_v2) (vec3_v1.x * vec3_v2.x + vec3_v1.y * vec3_v2.y + vec3_v1.z * vec3_v2.z)
+#define dot2D(vec2_v1, vec2_v2) (vec2_v1.x * vec2_v2.x + vec2_v1.y * vec2_v2.y)
+#define matrix2D_eval(float_a , float_b, float_c, float_d) (float_a*float_d - float_b*float_c)
+#define matgnitude(vec3_a) (sqrtf(dot(vec3_a, vec3_a)))
+#define magnitude2D(vec2_a) (sqrtf(dot2D(vec2_a, vec2_a)))
+
 
 // init of structs and methods as well as global vars and respective functions and macros
 //*****************************************************************************************************************************************************************************************
-
-// sizes for renderer
-#define num_triangles 300
-#define scr_w 512
-#define scr_h 512
-#define max_triangles_per_node 10 // max triangles in each BVH node before divisions stop
-#define node_density 1.0f // nodes per x, y, z of overall bounding box
-
-// constants
-#define fov 0.001
-
-// macros to replace functions
-#define dot(vec3_v1, vec3_v2) (vec3_v1.x * vec3_v2.x + vec3_v1.y * vec3_v2.y + vec3_v1.z * vec3_v2.z)
-#define matrix2D_eval(float_a , float_b, float_c, float_d) (float_a*float_d - float_b*float_c)
-#define magnitude(vec3_a) (sqrtf(dot(vec3_a, vec3_a)))
 
 // too lazy to set up cudas rng so i use this bad one
 inline __host__ __device__ long int xorRand(unsigned int seed) {
@@ -44,18 +42,36 @@ inline __host__ __device__ long int xorRand(unsigned int seed) {
     return seed;
 }
 
-// Define the vec3 struct
-typedef struct {
-    float x, y, z;
-    bool null;
-}vec3_tmp; // to avoid dynamic init(placeholder)
+struct vec2 {
+    float x, y;
 
+    __host__ __device__ vec2() : x(0.0f), y(0.0f) {}
+    __host__ __device__ vec2(float X, float Y) : x(X), y(Y) {}
+
+    inline __host__ __device__ vec2 operator+(const vec2& f) const {
+        return vec2(x + f.x, y + f.y);
+    }
+
+    inline __host__ __device__ vec2 operator-(const vec2& f) const {
+        return vec2(x - f.x, y - f.y);
+    }
+
+    inline __host__ __device__ vec2 operator*(const float scalar) const {
+        return vec2(x * scalar, y * scalar);
+    }
+
+    inline __host__ __device__ vec2 normalize() {
+        const float scl = magnitude2D((*this));
+        return vec2(x / scl, y / scl);
+    }
+};
+
+// Define the vec3 struct
 struct vec3 {
     float x, y, z;
-    bool null;
 
     __host__ __device__ vec3() : x(0), y(0), z(0) {}
-    __host__ __device__ vec3(float x, float y, float z) : x(x), y(y), z(z), null(false) {}
+    __host__ __device__ vec3(float x, float y, float z) : x(x), y(y), z(z) {}
 
     inline __host__ __device__ vec3 operator+(const vec3& f) const {
         return vec3(x + f.x, y + f.y, z + f.z);
@@ -70,8 +86,12 @@ struct vec3 {
     }
 
     inline __host__ __device__ vec3 normalize() {
-        const float scl = magnitude((*this));
+        const float scl = matgnitude((*this));
         return vec3(x / scl, y / scl, z / scl);
+    }
+
+    inline __host__ __device__ vec2 convert_vec2() {
+        return vec2(x / (z * fov), y / (z * fov));
     }
 };
 
@@ -85,40 +105,66 @@ inline __host__ __device__ vec3 cross(const vec3 v1, const vec3 v2) {
     return ret;
 }
 
-// for BVH traversal/init
-__device__ vec3_tmp min_point_BVH;
-__device__ vec3_tmp max_point_BVH;
-vec3_tmp BVHMin, BVHMax; // global CPU min/max
+inline __host__ __device__ float get_max(float f1, float f2) {
+    return (f1 > f2) * f1 + (f1 <= f2) * f2;
+}
 
-// structs
-struct color {
-    float r, g, b;
-    __host__ __device__ color(float R, float G, float B) : r(R), g(G), b(B) {}
-    __host__ __device__ color() : r(0), g(0), b(0) {}
+inline __host__ __device__ float get_min(float f1, float f2) {
+    return (f1 < f2) * f1 + (f1 >= f2) * f2;
+}
 
-    inline __host__ __device__ color operator+(const color& f) const {
-        return color(r + f.r, g + f.g, b + f.b);
+struct bounding_box{
+    vec2 min, max;
+
+    __host__ __device__ bounding_box(){}
+
+    __host__ __device__ bounding_box(const float minx, const float maxx, const float miny, const float maxy) : min(vec2(minx, miny)), max(vec2(maxx, maxy)){}
+};
+
+struct triangle2D {
+    vec2 p1, p2, p3;
+    float denom, y2_y3, x1_x3, x3_x2, y3_y1;
+    bounding_box bound_box;
+
+    __host__ __device__ triangle2D() {}
+
+    inline __host__ __device__ void calc_denom_and_vals() {
+        denom = (p2.y - p3.y) * (p1.x - p3.x) + (p3.x - p2.x) * (p1.y - p3.y);
+        y2_y3 = p2.y - p3.y;
+        x1_x3 = p1.x - p3.x;
+        x3_x2 = p3.x - p2.x;
+        y3_y1 = p3.y - p1.y;
+        float minx = get_min(p1.x, p2.x);
+        minx = get_min(minx, p3.x);
+
+        float maxx = get_max(p1.x, p2.x);
+        maxx = get_max(maxx, p3.x);
+
+        float miny = get_min(p1.y, p2.y);
+        miny = get_min(miny, p3.y);
+
+        float maxy = get_max(p1.y, p2.y);
+        maxy = get_max(maxy, p3.y);
+
+        bound_box = bounding_box(minx, maxx, miny, maxy);
     }
 
-    inline __host__ __device__ color operator*(const float f) const {
-        return color(r * f, g * f, b * f);
+    __host__ __device__ triangle2D(const vec2 P1, const vec2 P2, const vec2 P3) {
+        p1 = P1; p2 = P2; p3 = P3;
+        calc_denom_and_vals();
+    }
+
+    inline __host__ __device__ bool point_in_triangle(const vec2 p) {
+        const float x3m = p.x - p3.x;
+        const float y3m = p.y - p3.y;
+
+        const float a = (y2_y3 * x3m + x3_x2 * y3m) / denom;
+        const float b = (y3_y1 * x3m + x1_x3 * y3m) / denom;
+        const float c = 1.0f - a - b;
+        return 0 <= a && a <= 1 && 0 <= b && b <= 1 && 0 <= c && c <= 1;
     }
 };
 
-struct material {
-    color c;
-    float brightness, roughness;
-
-    __host__ __device__ material() : c(color(0.0f, 0.0f, 0.0f)) {}
-
-    __host__ __device__ material(color C, float B, float rough) : c(C), brightness(B), roughness(rough) {}
-};
-
-struct ray {
-    vec3 origin, direction;
-    __host__ __device__ ray() : origin(vec3(0.0f, 0.0f, 0.0f)), direction(vec3(0.0f, 0.0f, 0.0f)) {}
-    __host__ __device__ ray(vec3 origin, vec3 direction) : origin(origin), direction(direction) {}
-};
 
 struct triangle {
     vec3 p1, p2, p3;
@@ -128,7 +174,7 @@ struct triangle {
 
     __host__ __device__ triangle() : p1(vec3(0.0f, 0.0f, 0.0f)), p2(vec3(0.0f, 0.0f, 0.0f)), p3(vec3(0.0f, 0.0f, 0.0f)) {}
 
-    __host__ __device__ triangle(vec3 P1, vec3 P2, vec3 P3) {
+    __host__ __device__ triangle(const vec3 P1, const vec3 P2, const vec3 P3) {
         p1 = P1;
         p2 = P2;
         p3 = P3;
@@ -139,355 +185,121 @@ struct triangle {
         dot3131 = dot(sb31, sb31);
         nv = cross(sb21, sb31).normalize();
     }
-};
 
-inline __host__ __device__ float get_min(const float v1, const float v2, const float v3) {
-    const float minab = (v1 + v2 - fabs(v1 - v2)) / 2;
-    const float minfinal = (minab + v3 - fabs(minab - v3)) / 2;
-    return minfinal;
-}
-
-inline __host__ __device__ float get_max(const float v1, const float v2, const float v3) {
-    const float maxab = (v1 + v2 + fabs(v1 - v2)) / 2;
-    const float maxfinal = (maxab + v3 + fabs(maxab - v3)) / 2;
-    return maxfinal;
-}
-
-inline __host__ __device__ float get_min2(const float v1, const float v2) {
-    return (v1 + v2 - fabs(v1 - v2)) / 2;
-}
-
-inline __host__ __device__ float get_max2(const float v1, const float v2) {
-    return (v1 + v2 + fabs(v1 - v2)) / 2;
-}
-
-struct axis_aligning_bounding_box {
-    vec3 min, max;
-
-    __device__ axis_aligning_bounding_box(triangle t) {
-        min = vec3(get_min(t.p1.x, t.p2.x, t.p3.x), get_min(t.p1.y, t.p2.y, t.p3.y), get_min(t.p1.z, t.p2.z, t.p3.z));
-        max = vec3(get_max(t.p1.x, t.p2.x, t.p3.x), get_max(t.p1.y, t.p2.y, t.p3.y), get_max(t.p1.z, t.p2.z, t.p3.z));
-
-        // get bounding box of all bounding boxes :)
-        // fast bc its in cache
-        min_point_BVH.x = get_min2(min_point_BVH.x, min.x);
-        min_point_BVH.y = get_min2(min_point_BVH.y, min.y);
-        min_point_BVH.z = get_min2(min_point_BVH.z, min.z);
-
-        max_point_BVH.x = get_max2(max_point_BVH.x, max.x);
-        max_point_BVH.y = get_max2(max_point_BVH.y, max.y);
-        max_point_BVH.z = get_max2(max_point_BVH.z, max.z);
-    }
-
-    __host__ axis_aligning_bounding_box(triangle t, int placeholder) {
-        min = vec3(get_min(t.p1.x, t.p2.x, t.p3.x), get_min(t.p1.y, t.p2.y, t.p3.y), get_min(t.p1.z, t.p2.z, t.p3.z));
-        max = vec3(get_max(t.p1.x, t.p2.x, t.p3.x), get_max(t.p1.y, t.p2.y, t.p3.y), get_max(t.p1.z, t.p2.z, t.p3.z));
-
-        // get bounding box of all bounding boxes :)
-        BVHMin.x = get_min2(BVHMin.x, min.x);
-        BVHMin.y = get_min2(BVHMin.y, min.y);
-        BVHMin.z = get_min2(BVHMin.z, min.z);
-
-        BVHMax.x = get_max2(BVHMax.x, max.x);
-        BVHMax.y = get_max2(BVHMax.y, max.y);
-        BVHMax.z = get_max2(BVHMax.z, max.z);
+    inline __host__ __device__ triangle2D convert_to_2D() {
+        return triangle2D(p1.convert_vec2(), p2.convert_vec2(), p3.convert_vec2());
     }
 };
 
-// using grid method for BVH to make dynamic scenes fast
-struct grid_node {
-    vec3 bottomLeftForwardsPoint;
-    float length;
-    int cur_index = 0;
-    int triangle_indices[max_triangles_per_node];
+struct color {
+    float r, g, b;
 
-    __device__ grid_node(vec3 c, float l) : bottomLeftForwardsPoint(c), length(l) {}
+    __host__ __device__ color(){}
+    __host__ __device__ color(const float R, const float G, const float B) : r(R), g(G), b(B){}
 
-    __device__ void add_triangle(const int t_id) {
-        triangle_indices[cur_index] = t_id;
+    inline __host__ __device__ color operator+(const color& c) {
+        return color(r + c.r, g + c.g, b + c.b);
+    }
+
+    inline __host__ __device__ color operator*(const float f) {
+        return color(r * f, g * f, b * f);
+    }
+
+    inline __host__ __device__ color operator*(const bool f) {
+        return color(r * f, g * f, b * f);
     }
 };
 
-__device__ char* grid_nodes;
+// global device screen buffer
+__device__ char screen_buffer[sizeof(color) * scr_w * scr_h];
 
-inline __device__ grid_node init_grid_node(int x, int y, int z) {
-    return grid_node(vec3(x * node_density, y * node_density, z * node_density), node_density);
+// global device array of all triangles
+__device__ char triangles[sizeof(triangle) * num_triangles];
+
+// rasterization function tests
+inline __global__ void rasterize_triangles_single_thread(color c) {
+    int index = threadIdx.x + blockIdx.x * blockDim.x;
+    if (index >= num_triangles) { return; }
+    triangle2D t2D = ((triangle*)triangles)[index].convert_to_2D();
+
+    const int p_minx = (int)t2D.bound_box.min.x;
+    const int p_miny = (int)t2D.bound_box.min.y;
+    const int p_maxx = (int)t2D.bound_box.max.x;
+    const int p_maxy = (int)t2D.bound_box.max.y;
+    for(int x = p_minx; x <= p_maxx; x++) {
+        for (int y = p_miny; y < p_maxy; y++) {
+            ((color*)screen_buffer)[x + y * scr_w] = c * t2D.point_in_triangle(vec2(x, y));
+        }
+    }
 }
-__global__ void nodeInitKernel(const int numNodesX, const int numNodesY, const int numNodesZ) {
-    const int id = threadIdx.x + blockIdx.x * blockDim.x;
-    const int zLayer = id / (numNodesX * numNodesY);
-    const int tmp = id % (numNodesX * numNodesY);
-    const int xLayer = tmp % numNodesX;
-    const int yLayer = tmp / numNodesX;
 
-    ((grid_node*)grid_nodes)[id] = init_grid_node(xLayer, yLayer, zLayer);
-}
+__global__ void rasterize_triangle_multi_thread(int index, color c) {
+    __shared__ triangle2D t2D;
+    __shared__ vec2 min, max;
 
-#define threads_grid_alloc 256
+    int id = threadIdx.x + blockIdx.x * blockDim.x;
 
-void allocGridNodes() {
-    // assumes min and max points of BVH are already defined. Can only be run after triangle init
-    // 
-    // cuda malloc funcs onyl accessible in host funcs.. 
-    cudaMemcpyFromSymbol(&BVHMin, &min_point_BVH, sizeof(vec3_tmp));
-    cudaMemcpyFromSymbol(&BVHMax, &max_point_BVH, sizeof(vec3_tmp));
-
-    const int numNodesX = (BVHMax.x - BVHMin.x) / node_density;
-    const int numNodesY = (BVHMax.y - BVHMin.y) / node_density;
-    const int numNodesZ = (BVHMax.z - BVHMin.z) / node_density;
-
-    char* tmpPtr;
-    cudaMalloc(&tmpPtr, sizeof(grid_node) * numNodesX * numNodesY * numNodesZ);
-    cudaMemcpyToSymbol(grid_nodes, &tmpPtr, sizeof(char*));
+    if (id == 0) {
+        t2D = ((triangle*)triangles)[index].convert_to_2D();
+        min = t2D.bound_box.min;
+        max = t2D.bound_box.max;
+    }
     
-    const int numBlocks = numNodesX * numNodesY * numNodesZ / threads_grid_alloc;
+    const int x_dif = max.x - min.x;
+    const int y_dif = max.y - min.y;
 
-    nodeInitKernel << <threads_grid_alloc, numBlocks >> > (numNodesX, numNodesY, numNodesZ);
+    if (id > x_dif * y_dif) { return; }
 
-    grid_node* gridNodesCPU = (grid_node*)malloc(numNodesX * numNodesY * numNodesZ * sizeof(grid_node));
+    const int x = id % x_dif + min.x;
+    const int y = id / x_dif + min.y;
 
-    // TODO: change grid_node struct to have a pointer instead of array(or do subdividing nodes)
-    // TODO: !!! add cudaMalloc for each node later on to do dynamic init of num of triangles per node !!!
-
-    // because dynamic init isn't supported on GPU, its done CPU
-
-    // 
+    ((color*)screen_buffer)[x + y * scr_w] = c * t2D.point_in_triangle(vec2(x, y));
 }
 
-// global device arrs
-// init as chars to bypass restrictions on dynamic initialization
-__device__ char triangles[num_triangles * sizeof(triangle)]; // all triangles(on global mem, so slow access)
-char trianglesCPU[num_triangles * sizeof(triangle)];
-__device__ char triangle_materials[num_triangles * sizeof(material)]; // materials corresponding to triangles
-__device__ char aabb_arr[num_triangles * sizeof(axis_aligning_bounding_box)];
-char aabb_arrCPU[num_triangles * sizeof(axis_aligning_bounding_box)];
-__device__ char screen_buffer[scr_w * scr_h * sizeof(color)];
-
-// cached triangles arr to prevent more lookups to global
-__constant__ char triangles_cached[10];
-
-typedef struct {
-    vec3 intersect;
-    float dist;
-}intersect_pkg;
-
-inline __device__ intersect_pkg get_triangle_intersect(const ray r, const triangle t) {
-    const float disc = dot(r.direction, t.nv);
-    const float dt = fabs(disc);
-    intersect_pkg ret;
-
-    if (dt <= 1e-10) { // check if the plane and ray are paralell enough to be ignored
-        ret.intersect.null = true;
-        return ret;
-    }
-
-    vec3 temp_sub =t.p1 - r.origin;
-    temp_sub = r.direction * __fdividef(dot(t.nv, temp_sub), disc);// fast division since fastmath doesnt work on my system for some reason
-    ret.intersect = r.origin + temp_sub;
-    const vec3 v2 = ret.intersect - t.p1;
-    const float dot02 = dot(t.sb21, v2);
-    const float dot12 = dot(t.sb31, v2);
-    const float disc2 = (t.dot2121 * t.dot3131 - t.dot2131 * t.dot2131);
-    if (disc2 == 0.0f) { ret.intersect.null = true; return ret; }
-    const float u = (t.dot3131 * dot02 - t.dot2131 * dot12) / disc2;
-    const float v = (t.dot2121 * dot12 - t.dot2131 * dot02) / disc2;
-    if ((((u < 0) || (v < 0) || (u + v > 1) || dot(temp_sub, r.direction) < 0.0f))) { ret.intersect.null = true; return ret; }
-    ret.dist = magnitude(temp_sub);
-    return ret;
+int clamp(int i) {
+    return (i < max_streams) ? i : max_streams;
 }
 
-inline __device__ vec3 get_grid_node_intersect(const ray r, const grid_node n) {
-    float closest_dist = 1e20f;
-    vec3 intersect; intersect.null = true;
-    for (int i = 0; i < n.cur_index; i++) {
-        intersect_pkg it = get_triangle_intersect(r, ((triangle*)triangles)[n.triangle_indices[i]]);
-        if (it.dist < closest_dist) {
-            closest_dist = it.dist;
-            intersect = it.intersect;
+// being worked on
+/*
+void rasterize_all_triangles_multi_thread() {
+    cudaStream_t streams[max_streams];
+
+    const int num_iterations = num_triangles / max_streams + 1;
+
+    int total_tris = 0;
+
+    for (int i = 0; i < num_iterations; i++) {
+        const int num_streams = clamp((num_triangles - total_tris));
+        total_tris += num_streams;
+        for (int s = 0; s < num_streams; s++) {
+            cudaStreamCreate(&streams[s]);
+            rasterize_triangle_multi_thread<<<512, >>>(s, color(1.0f, 0.0f, 0.0f));
         }
     }
-    return intersect;
+}
+*/
+
+void rasterize_all_triangles(color c) {
+    rasterize_triangles_single_thread << <256, num_triangles / 256 + 1 >> > (c);
 }
 
-typedef struct {
-    vec3 intersect, nv;
-    float dist;
-    color c;
-}intersect_pkg_2;
-
-inline __device__ intersect_pkg_2 get_all_triangle_intersect(const ray r) {
-    intersect_pkg_2 ret;
-    ret.dist = 1e20;
-
-    for (int t = 0; t < num_triangles; t++) {
-        const triangle tmp = ((triangle*)triangles)[t];
-        intersect_pkg it = get_triangle_intersect(r, tmp);
-        if (it.dist < ret.dist) {
-            ret.intersect = it.intersect;
-            ret.c = ((material*)triangle_materials)[t].c;
-            ret.dist = it.dist;
-            ret.nv = tmp.nv;
-        }
-    }
-    return ret;
-}
-
-inline __device__ float get_specular_intensity(const ray r, const vec3 light_point, const float light_strength, const int spec_pow) {
-    const vec3 light_dir = light_point - r.origin;
-    return -1 * pow(dot(light_dir, r.direction), spec_pow) * light_strength;
-}
-
-inline __device__ float get_diffuse_intensity(const ray intersect, vec3 normal_vec, const vec3 light_point, const float light_intensity) {
-    // after intersect, calc diffuse intensity
-
-    if (dot(intersect.direction, normal_vec) >= 0.0f) {
-        normal_vec = normal_vec * -1;
-    }
-
-    const vec3 vec_to_light = light_point - intersect.origin;
-    const float dt = dot(vec_to_light, normal_vec);
-    return (dt <= 0.0f) * 0.0f + (dt > 0.0f) * dt * light_intensity; // avoid branching
-}
-
-inline __device__ float get_total_light_intensity(const ray intersect, const vec3 nv, const vec3 light_point, const float light_intensity, const float ambient_intensity) {
-    return get_diffuse_intensity(intersect, nv, light_point, light_intensity) + get_specular_intensity(intersect, light_point, light_intensity, 10) + ambient_intensity;
-}
-
-inline __device__ color get_pixel_color_test(const ray r, const float ambient_intensity) {
-    return color(1.0f * get_all_triangle_intersect(r).intersect.null, 0.0f, 0.0f);
-}
-
-inline __device__ color get_pixel_color(const ray r, const float ambient_intensity, const float light_intensity, const vec3 light_point) {
-    intersect_pkg_2 r_ret = get_all_triangle_intersect(r);
-    color ret = r_ret.c * get_total_light_intensity(ray(r_ret.intersect, r.direction), r_ret.nv, light_point, light_intensity, ambient_intensity);
-}
-
-__global__ void init_triangle(vec3 p1, vec3 p2, vec3 p3, material m, int index) {
-    const triangle t = triangle(p1, p2, p3);
-    ((triangle*)triangles)[index] = t;
-    ((material*)triangle_materials)[index] = m;
-    ((axis_aligning_bounding_box*)aabb_arr)[index] = axis_aligning_bounding_box(t);
-}
-
-void initTriangle(vec3 p1, vec3 p2, vec3 p3, material m, int index) {
-    init_triangle << <1, 1 >> > (p1, p2, p3, m, index);
-    const triangle t = triangle(p1, p2, p3);
-    ((triangle*)trianglesCPU)[index] = t;
-    ((axis_aligning_bounding_box*)aabb_arrCPU)[index] = axis_aligning_bounding_box(t,0); // int to differentiate host from device call(compiler is stupid)
-}
-
-char cpuColors[scr_w * scr_h * sizeof(color)];
-
-__global__ void fillBufferTest() {
-    const int id = threadIdx.x + blockIdx.x * blockDim.x;
-    const int x = id % scr_w;
-    const int y = id / scr_w;
-    ray r = ray(vec3(x, y, 0.0f), vec3(x * fov, y * fov, 1.0f));
-    ((color*)screen_buffer)[id] = get_pixel_color_test(r, 1.0f);
-}
-
-void fillBufferTestCall() {
-    fillBufferTest << <512, scr_w* scr_h / 512 >> > ();
-    cudaMemcpyFromSymbol(cpuColors, screen_buffer, sizeof(color) * scr_w * scr_h);
-}
-
-__global__ void fillBuffer() {
-    const int id = threadIdx.x + blockIdx.x * blockDim.x;
-    const int x = id % scr_w;
-    const int y = id / scr_w;
-    ray r = ray(vec3(x, y, 0.0f), vec3(x * fov, y * fov, 1.0f));
-    ((color*)screen_buffer)[id] = get_pixel_color_test(r, 1.0f);
-}
-
-//*****************************************************************************************************************************************************************************************
-// stl loader
-
-bool read_stl(const std::string& filename, material m, int start_idx) {
-    std::ifstream file(filename, std::ios::binary);
-    if (!file) {
-        return false;
-    }
-
-
-    file.seekg(80, std::ios::beg);
-
-
-    unsigned int numTriangles;
-    file.read(reinterpret_cast<char*>(&numTriangles), sizeof(numTriangles));
-
-    // Read each triangle
-    for (unsigned int i = 0; i < numTriangles; ++i) {
-        // Skip normal vector (3 floats)
-        float normal[3];
-        file.read(reinterpret_cast<char*>(&normal), sizeof(normal));
-
-        // Read the 3 vertices of the triangle
-        triangle t;
-        file.read(reinterpret_cast<char*>(&t.p1.x), sizeof(float));  // p1.x
-        file.read(reinterpret_cast<char*>(&t.p1.y), sizeof(float));  // p1.y
-        file.read(reinterpret_cast<char*>(&t.p1.z), sizeof(float));  // p1.z
-
-        file.read(reinterpret_cast<char*>(&t.p2.x), sizeof(float));  // p2.x
-        file.read(reinterpret_cast<char*>(&t.p2.y), sizeof(float));  // p2.y
-        file.read(reinterpret_cast<char*>(&t.p2.z), sizeof(float));  // p2.z
-
-        file.read(reinterpret_cast<char*>(&t.p3.x), sizeof(float));  // p3.x
-        file.read(reinterpret_cast<char*>(&t.p3.y), sizeof(float));  // p3.y
-        file.read(reinterpret_cast<char*>(&t.p3.z), sizeof(float));  // p3.z
-
-        // Skip attribute byte count (2 bytes)
-        unsigned short attribute;
-        file.read(reinterpret_cast<char*>(&attribute), sizeof(attribute));
-
-        // Call add_triangle with the triangle and index
-        initTriangle(t.p1, t.p2, t.p3, m, start_idx + i);
-    }
-
-    file.close();
-    return true;
-}
-
-// Function to read an ASCII STL file and add triangles
-bool read_ascii_stl(const std::string& filename, material m, int start_idx) {
-    std::ifstream file(filename);
-    if (!file) {
-        return false;
-    }
-
-    std::string line;
-    int idx = start_idx;
-    while (std::getline(file, line)) {
-        if (line.find("facet normal") != std::string::npos) {
-            // Skip the normal line
-            std::getline(file, line);
-
-            // Read the 3 vertices of the triangle
-            triangle t;
-            for (int i = 0; i < 3; ++i) {
-                std::getline(file, line);
-                std::stringstream ss(line);
-                std::string temp;
-                ss >> temp >> t.p1.x >> t.p1.y >> t.p1.z;
-            }
-
-            // Skip the endfacet line
-            std::getline(file, line);
-
-            // Call add_triangle with the triangle and index
-            initTriangle(t.p1, t.p2, t.p3, m, idx);
-            printf("%f %f %f\n", t.p1.x, t.p1.y, t.p1.z);
-            idx++;
-        }
-    }
-
-    file.close();
-    return true;
+void add_triangle(vec3 p1, vec3 p2, vec3 p3, int idx) {
+    triangle t = triangle(p1, p2, p3);
+    cudaMemcpyToSymbol(triangles, &t, sizeof(triangle), sizeof(triangle) * idx);
 }
 
 //*****************************************************************************************************************************************************************************************
 // opengl stuff
 // draws 2 triangles at z=0 and textures them with the pixel colors outputted by the cuda program
-// no interop, data transfers from GPU to CPU and back to GPU each frame
+// no interop, data transfers from GPU to CPU each frame
+
+char cpu_colors[sizeof(color) * scr_w * scr_h];
+
+void copyBufferToCPU() {
+    cudaMemcpyFromSymbol(cpu_colors, screen_buffer, sizeof(color) * scr_w * scr_h);
+}
+
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 void processInput(GLFWwindow* window);
 
@@ -526,8 +338,9 @@ float truncate(float f) {
 int main()
 {
     // add triangles
-    initTriangle(vec3(0.0f, 0.0f, 1.0f), vec3(100.0f, 0.0f, 1.0f), vec3(100.0f, 100.0f, 1.0f), material(color(1.0f, 0.0f, 0.0f), 1.0f, 1.0f), 0);
-
+    for (int t = 0; t < num_triangles; t++) {
+        add_triangle(vec3(0.0f, 0.0f, 1.0f), vec3(100.0f, 0.0f, 1.0f), vec3(100.0f, 100.0f, 1.0f), t);
+    }
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -538,10 +351,7 @@ int main()
     GLFWmonitor* monitor = glfwGetPrimaryMonitor();
     const GLFWvidmode* mode = glfwGetVideoMode(monitor);
 
-    GLFWwindow* window = glfwCreateWindow(1920, 1080, "Cuda-openGL Interop", NULL, NULL);
-
-    glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_FALSE);  // Remove window decorations
-    glfwSetWindowAttrib(window, GLFW_RESIZABLE, GLFW_FALSE);  // Make the window non-resizable
+    GLFWwindow* window = glfwCreateWindow(scr_w, scr_h, "Cuda-openGL Interop", NULL, NULL);
 
     glfwMakeContextCurrent(window);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
@@ -625,7 +435,7 @@ int main()
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST_MIPMAP_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, scr_w, scr_h, 0, GL_RGB, GL_FLOAT, cpuColors);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, scr_w, scr_h, 0, GL_RGB, GL_FLOAT, cpu_colors);
 	glGenerateMipmap(GL_TEXTURE_2D);
     glUseProgram(shaderProgram); 
     glUniform1i(glGetUniformLocation(shaderProgram, "texture1"), 0);
@@ -642,9 +452,10 @@ int main()
         int ind = 0;
         // **
         // dodaj boje tu u pixels
-        fillBufferTestCall();
+        rasterize_all_triangles(color(1.0f, 0.0f, 0.0f));
+        copyBufferToCPU();
         // **
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, scr_w, scr_h, 0, GL_RGB, GL_FLOAT, cpuColors);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, scr_w, scr_h, 0, GL_RGB, GL_FLOAT, cpu_colors);
 		glGenerateMipmap(GL_TEXTURE_2D);
         // bind textures on corresponding texture units
         glActiveTexture(GL_TEXTURE0);
@@ -660,8 +471,21 @@ int main()
         end = clock();
         if (frame % 10 == 1) {
             int fps = 10000 / (frametime);
-            fps = fps < 100 ? fps : 99;
-            printf("\rFPS: %d", fps);
+            if (fps < 10) {
+                printf("\rFPS: 000%d", fps);
+            }
+
+            if (fps < 100) {
+                printf("\rFPS: 00%d", fps);
+            }
+
+            else if (fps < 1000) {
+                printf("\rFPS: 0%d", fps);
+            }
+            
+            else {
+                printf("\rFPS: %d", fps);
+            }
             frametime = 0;
         }
         frame++;
