@@ -14,3 +14,5 @@ depth masks done:
 
 first model rendered!!(low-poly knight figure from chess):
 ![image](https://github.com/user-attachments/assets/5a7d93d4-0252-4fa7-83a1-15a2170bf2ae)
+
+depth mask of said model: ![image](https://github.com/user-attachments/assets/b1612ec0-a2fe-4e6c-b29c-9c0574295285)
