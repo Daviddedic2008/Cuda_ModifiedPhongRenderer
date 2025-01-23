@@ -17,7 +17,7 @@
 #define scr_w 512
 #define scr_h 512
 
-#define num_triangles 1
+#define num_triangles 100000
 #define max_streams 512
 
 cudaError_t ercall;
@@ -162,7 +162,6 @@ struct triangle2D {
 
     __host__ __device__ triangle2D(const vec2 P1, const vec2 P2, const vec2 P3) {
         p1 = P1; p2 = P2; p3 = P3;
-        calc_denom_and_vals();
     }
 
     inline __host__ __device__ barycentric_return point_in_triangle(const vec2 p, int seed) const {
@@ -227,21 +226,29 @@ struct color {
 // global device screen buffer
 __device__ char screen_buffer[sizeof(color) * scr_w * scr_h];
 
+__device__ float depth_buffer[scr_w * scr_h];
+
 // global device array of all triangles
 __device__ char triangles[sizeof(triangle) * num_triangles];
 
-__global__ void fillPixels(const int minx, const int maxx, const int miny, const int maxy, color c, triangle2D t2D) {
+__global__ void fillPixels(const int minx, const int maxx, const int miny, const int maxy, color c, triangle2D t2D, const vec3 z_coords) {
     const int id = threadIdx.x + blockIdx.x * blockDim.x;
 
-    const int x = id % (maxx - minx);
-    const int y = id / (maxx - minx);
+    const int x = id % (maxx - minx) + minx;
+    const int y = id / (maxx - minx) + miny;
 
     vec2 v = vec2(x, y);
 
     const barycentric_return r = t2D.point_in_triangle(vec2(x, y), 10 * id);
 
-    if (r.a >= 0.0f && r.b >= 0.0f && r.c >= 0.0f) {
-        ((color*)screen_buffer)[x + y * scr_w] = color(r.a, r.b, r.c);
+    const float z = z_coords.x * r.a + z_coords.y * r.b + z_coords.z * r.c;
+
+    const float d = depth_buffer[x + y * scr_w];
+
+    depth_buffer[x + y * scr_w] = (d == 0) * z + (d > z) * z + (d != 0 && d > z) * d;
+
+    if (r.a >= -0.001f && r.b >= -0.001f && r.c >= -0.001f) {
+        ((color*)screen_buffer)[x + y * scr_w] = color(z / 10.0f, z / 10.0f, z / 10.0f);
     }
 }
 
@@ -249,14 +256,23 @@ __global__ void fillPixels(const int minx, const int maxx, const int miny, const
 __global__ void rasterize_triangles_single_thread(color c) {
     const int index = threadIdx.x + blockIdx.x * blockDim.x;
     if (index >= num_triangles) { return; }
-    const triangle2D t2D = ((triangle*)triangles)[index].convert_to_2D();
+    triangle t = ((triangle*)triangles)[index];
+    triangle2D t2D = t.convert_to_2D();
+    const vec2 tmp = vec2(scr_w / 2, scr_h / 2);
+    t2D.p1 = t2D.p1 + tmp;
+    t2D.p2 = t2D.p2 + tmp;
+    t2D.p3 = t2D.p3 + tmp;
+    
+    t2D.calc_denom_and_vals();
+
+    const vec3 z_coords = vec3(t.p1.z, t.p2.z, t.p3.z);
 
     const int p_minx = (int)t2D.bound_box.min.x;
     const int p_miny = (int)t2D.bound_box.min.y;
     const int p_maxx = (int)t2D.bound_box.max.x;
-    const int p_maxy = (int)t2D.bound_box.max.y+3;
+    const int p_maxy = (int)t2D.bound_box.max.y;
 
-    fillPixels << <512, (p_maxx - p_minx) * (p_maxy - p_miny) / 512 >> > (p_minx, p_maxx, p_miny, p_maxy, c, t2D);
+    fillPixels << <512, (p_maxx - p_minx) * (p_maxy - p_miny) / 512+1 >> > (p_minx, p_maxx, p_miny, p_maxy, c, t2D, z_coords);
 }
 
 int clamp(int i) {
@@ -343,7 +359,7 @@ int main()
 {
     // add triangles
     for (int t = 0; t < num_triangles; t++) {
-        add_triangle(vec3(0.0f, 0.0f, 1.0f), vec3(100.0f, 0.0f, 1.0f), vec3(50.0f, 86.6f, 1.0f), t);
+        add_triangle(vec3(-50.0f, -43.3f, 1.0f), vec3(50.0f, -43.3f, 1.0f), vec3(0.0f, 43.3f, 10.0f), t);
     }
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
