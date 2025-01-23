@@ -12,12 +12,13 @@
 #include <string.h>
 #include <fstream>
 #include <sstream>
+#include <iostream>
 
-#define fov 1.0f
+#define fov 0.015f
 #define scr_w 512
 #define scr_h 512
 
-#define num_triangles 100000
+#define num_triangles 618
 #define max_streams 512
 
 cudaError_t ercall;
@@ -231,8 +232,30 @@ __device__ float depth_buffer[scr_w * scr_h];
 // global device array of all triangles
 __device__ char triangles[sizeof(triangle) * num_triangles];
 
-__global__ void fillPixels(const int minx, const int maxx, const int miny, const int maxy, color c, triangle2D t2D, const vec3 z_coords) {
+__global__ void fillPixels(color c, triangle2D t2D, const vec3 z_coords) {
     const int id = threadIdx.x + blockIdx.x * blockDim.x;
+
+    const int tmp = (t2D.bound_box.max.x - t2D.bound_box.min.x);
+
+    const int x = id % tmp + t2D.bound_box.min.x;
+    const int y = id / tmp + t2D.bound_box.min.y;
+
+    vec2 v = vec2(x, y);
+
+    const barycentric_return r = t2D.point_in_triangle(vec2(x, y), 10 * id);
+
+    const float z = z_coords.x * r.a + z_coords.y * r.b + z_coords.z * r.c;
+
+    const float d = depth_buffer[x + y * scr_w];
+
+    if (r.a >= -0.001f && r.b >= -0.001f && r.c >= -0.001f && (d == 0 || d > z)) {
+        //((color*)screen_buffer)[x + y * scr_w] = color(r.a, r.b, r.c);
+        depth_buffer[x + y * scr_w] = z;
+        ((color*)screen_buffer)[x + y * scr_w] = color(1.0f, z / 30.0f, z / 30.0f);
+    }
+}
+
+__device__ void fillPixel(const int id, const int minx, const int maxx, const int miny, const int maxy, color c, triangle2D t2D, const vec3 z_coords) {
 
     const int x = id % (maxx - minx) + minx;
     const int y = id / (maxx - minx) + miny;
@@ -247,8 +270,8 @@ __global__ void fillPixels(const int minx, const int maxx, const int miny, const
 
     depth_buffer[x + y * scr_w] = (d == 0) * z + (d > z) * z + (d != 0 && d > z) * d;
 
-    if (r.a >= -0.001f && r.b >= -0.001f && r.c >= -0.001f) {
-        ((color*)screen_buffer)[x + y * scr_w] = color(z / 10.0f, z / 10.0f, z / 10.0f);
+    if (r.a >= -0.01f && r.b >= -0.01f && r.c >= -0.01f) {
+        ((color*)screen_buffer)[x + y * scr_w] = color(1.0f, z / 10.0f, z / 10.0f);
     }
 }
 
@@ -272,8 +295,10 @@ __global__ void rasterize_triangles_single_thread(color c) {
     const int p_maxx = (int)t2D.bound_box.max.x;
     const int p_maxy = (int)t2D.bound_box.max.y;
 
-    fillPixels << <512, (p_maxx - p_minx) * (p_maxy - p_miny) / 512+1 >> > (p_minx, p_maxx, p_miny, p_maxy, c, t2D, z_coords);
+    fillPixels << <512, (p_maxx - p_minx) * (p_maxy - p_miny) / 512+1 >> > (c, t2D, z_coords);
 }
+
+#define threads_rasterization 1024
 
 int clamp(int i) {
     return (i < max_streams) ? i : max_streams;
@@ -300,7 +325,7 @@ void rasterize_all_triangles_multi_thread() {
 */
 
 void rasterize_all_triangles(color c) {
-    rasterize_triangles_single_thread << <1024, num_triangles / 1024 + 1 >> > (c);
+    rasterize_triangles_single_thread << <threads_rasterization, num_triangles / threads_rasterization + 1 >> > (c);
     cudaDeviceSynchronize();
 }
 
@@ -308,6 +333,34 @@ void add_triangle(vec3 p1, vec3 p2, vec3 p3, int idx) {
     triangle t = triangle(p1, p2, p3);
     cudaMemcpyToSymbol(triangles, &t, sizeof(triangle), sizeof(triangle) * idx);
 }
+
+void loadRawModel(const char* filename, int start_idx = 0) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file) {
+        std::cerr << "Unable to open file: " << filename << std::endl;
+        return;
+    }
+
+    int i = 0;
+    while (file.good()) {
+        vec3 vertices[3];
+
+        file.read(reinterpret_cast<char*>(&vertices[0]), sizeof(vec3));
+        file.read(reinterpret_cast<char*>(&vertices[1]), sizeof(vec3));
+        file.read(reinterpret_cast<char*>(&vertices[2]), sizeof(vec3));
+
+        for (int i2 = 0; i2 < 3; i2++) { float tmp = vertices[i2].z; vertices[i2].z = vertices[i2].y + 45.0f; vertices[i2].y = tmp; }
+
+        if (!file.eof()) {
+            add_triangle(vertices[0], vertices[1], vertices[2], start_idx + i);
+            ++i;
+        }
+    }
+
+    file.close();
+}
+
+
 
 //*****************************************************************************************************************************************************************************************
 // opengl stuff
@@ -358,9 +411,9 @@ float truncate(float f) {
 int main()
 {
     // add triangles
-    for (int t = 0; t < num_triangles; t++) {
-        add_triangle(vec3(-50.0f, -43.3f, 1.0f), vec3(50.0f, -43.3f, 1.0f), vec3(0.0f, 43.3f, 10.0f), t);
-    }
+    
+    loadRawModel("C:\\Users\\david\\Downloads\\pythonAndModels\\raw_model.raw");
+
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
