@@ -9,3 +9,5 @@ rasterizer benchmark #1: rasterizes 1,000,000 triangles per second on a 4050 mob
 first "fragment" shader written in my renderer:
 ![image](https://github.com/user-attachments/assets/4faa754d-d838-40df-b5b3-5c6bad525ff2)
 
+depth masks done:
+![image](https://github.com/user-attachments/assets/dd232935-21ca-4803-8ed4-dcde65fdfb8f)
