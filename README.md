@@ -18,5 +18,5 @@ first model rendered!!(low-poly knight figure from chess):
 
 depth mask of said model: ![image](https://github.com/user-attachments/assets/c3fd2f56-fbcb-41bd-84e4-0446de47cc71)
 
-
+interpolated vertex norm map: ![image](https://github.com/user-attachments/assets/198da4c7-50f0-45a1-98cc-a25665945f4c)
 
