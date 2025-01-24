@@ -244,7 +244,7 @@ typedef struct {
     vec3 v1, v2, v3;
 }triplevec3;
 
-__global__ void fillPixels(color c, triangle2D t2D, const vec3 z_coords, const triplevec3 n) {
+__global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3 n) {
     const int id = threadIdx.x + blockIdx.x * blockDim.x;
 
     const int tmp = (t2D.bound_box.max.x - t2D.bound_box.min.x);
@@ -252,24 +252,23 @@ __global__ void fillPixels(color c, triangle2D t2D, const vec3 z_coords, const t
     const int x = id % tmp + t2D.bound_box.min.x;
     const int y = id / tmp + t2D.bound_box.min.y;
 
-    vec2 v = vec2(x, y);
-
     const barycentric_return r = t2D.point_in_triangle(vec2(x, y), 10 * id);
 
     const float z = __fmaf_rn(z_coords.x, r.a, __fmaf_rn(z_coords.y, r.b, z_coords.z * r.c));
 
-    const vec3 pos = vec3(v.x, v.y, z);
+    const vec3 pos = vec3(x, y, z);
 
     const float d = depth_buffer[x + y * scr_w];
 
     const vec3 interpolated_norm = vec3(__fmaf_rn(n.v1.x, r.a, __fmaf_rn(n.v2.x, r.b, n.v3.x * r.c)), __fmaf_rn(n.v1.y, r.a, __fmaf_rn(n.v2.y, r.b, n.v3.y * r.c)), __fmaf_rn(n.v1.z, r.a, __fmaf_rn(n.v2.z, r.b, n.v3.z * r.c)));
 
-    if (r.a >= -0.02f && r.b >= -0.02f && r.c >= -0.02f && (d == 0 || d > z)) {
-        //((color*)screen_buffer)[x + y * scr_w] = color(r.a, r.b, r.c);
-        depth_buffer[x + y * scr_w] = z;
-        //((color*)screen_buffer)[x + y * scr_w] = color(1.0f, (z-22) / 20.0f, (z-22) / 20.0f);
-        ((color*)screen_buffer)[x + y * scr_w] = color(interpolated_norm.x, interpolated_norm.y, interpolated_norm.z);
+    if (!(r.a >= -0.02f && r.b >= -0.02f && r.c >= -0.02f && (d == 0 || d > z))) {
+        return;
     }
+    //((color*)screen_buffer)[x + y * scr_w] = color(r.a, r.b, r.c);
+    depth_buffer[x + y * scr_w] = z;
+    //((color*)screen_buffer)[x + y * scr_w] = color(1.0f, (z-22) / 20.0f, (z-22) / 20.0f);
+    ((color*)screen_buffer)[x + y * scr_w] = color(interpolated_norm.x, interpolated_norm.y, interpolated_norm.z);
 }
 
 inline __device__ void fillPixel(const int id, const int minx, const int maxx, const int miny, const int maxy, color c, triangle2D t2D, const vec3 z_coords, vec3 nv, const int t_id) {
@@ -299,32 +298,24 @@ inline __device__ void fillPixel(const int id, const int minx, const int maxx, c
 }
 
 // rasterization function tests
-__global__ void rasterize_triangles_single_thread(color c) {
+__global__ void rasterize_triangles_single_thread() {
     const int index = threadIdx.x + blockIdx.x * blockDim.x;
     if (index >= num_triangles) { return; }
     triangle t = ((triangle*)triangles)[index];
     triangle2D t2D = t.convert_to_2D();
+
     const vec2 tmp = vec2(scr_w / 2, scr_h / 2);
+
     t2D.p1 = t2D.p1 + tmp;
     t2D.p2 = t2D.p2 + tmp;
     t2D.p3 = t2D.p3 + tmp;
     
     t2D.calc_denom_and_vals();
 
-    const vec3 z_coords = vec3(t.p1.z, t.p2.z, t.p3.z);
-
-    const triplevec3 n = ((triplevec3*)vertex_norms)[index];
-
-    const int p_minx = (int)t2D.bound_box.min.x;
-    const int p_miny = (int)t2D.bound_box.min.y;
-    const int p_maxx = (int)t2D.bound_box.max.x;
-    const int p_maxy = (int)t2D.bound_box.max.y;
-
-
-    fillPixels << <32, (p_maxx - p_minx) * (p_maxy - p_miny) / 32+1 >> > (c, t2D, z_coords, n);
+    fillPixels << <32, ((int)t2D.bound_box.max.x - (int)t2D.bound_box.min.x) * ((int)t2D.bound_box.max.y - (int)t2D.bound_box.min.y) / 32 + 1 >> > (t2D, vec3(t.p1.z, t.p2.z, t.p3.z), ((triplevec3*)vertex_norms)[index]);
 }
 
-#define threads_rasterization 512
+#define threads_rasterization 256
 
 int clamp(int i) {
     return (i < max_streams) ? i : max_streams;
@@ -350,9 +341,8 @@ void rasterize_all_triangles_multi_thread() {
 }
 */
 
-void rasterize_all_triangles(color c) {
-    rasterize_triangles_single_thread << <threads_rasterization, num_triangles / threads_rasterization + 1 >> > (c);
-    cudaDeviceSynchronize();
+void rasterize_all_triangles() {
+    rasterize_triangles_single_thread << <threads_rasterization, num_triangles / threads_rasterization + 1 >> > ();
 }
 
 void add_triangle(vec3 p1, vec3 p2, vec3 p3, int idx) {
@@ -586,7 +576,7 @@ int main()
         // **
         // dodaj boje tu u pixels
         for (int i = 0; i < 1000; i++) {
-            rasterize_all_triangles(color(1.0f, 0.0f, 0.0f));
+            rasterize_all_triangles();
         }
         copyBufferToCPU();
         // **
@@ -603,14 +593,13 @@ int main()
 
         glfwSwapBuffers(window);
         glfwPollEvents();
-        cudaDeviceSynchronize();
-        /*if (frame % 10 == 1) {
+        if (frame % 10 == 1) {
             int fps = 10000 / (frametime);
             //printf("%d\n", fps);
             if (fps < 10) {
                 printf("\rFPS: 000%d", fps);
             }
-            if (fps < 100) {
+            else if (fps < 100) {
                 printf("\rFPS: 00%d", fps);
             }
             else if (fps < 1000) {
@@ -621,7 +610,7 @@ int main()
                 printf("\rFPS: %d", fps);
             }
             frametime = 0;
-        }*/
+        }
         
         
         cudaDeviceSynchronize();
@@ -630,7 +619,7 @@ int main()
         float milis;
         cudaEventElapsedTime(&milis, start, end);
         frametime += milis;
-        printf("%f\n", milis);
+        //printf("%f\n", milis);
         printLastErrorCUDA()
     }
     glDeleteVertexArrays(1, &VAO);
