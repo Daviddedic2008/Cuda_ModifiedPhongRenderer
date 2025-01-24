@@ -13,12 +13,17 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
+#include <unordered_map>
+#include <vector>
+#include <list>
+#include <algorithm>
+#include <cuda_fp16.h>
 
-#define fov 0.015f
+#define fov 0.0035f
 #define scr_w 512
 #define scr_h 512
 
-#define num_triangles 618
+#define num_triangles 207
 #define max_streams 512
 
 cudaError_t ercall;
@@ -67,10 +72,10 @@ struct vec2 {
         return vec2(x / scl, y / scl);
     }
 
-    inline __host__ __device__ float dist_from_vec(vec2& v) {
+    inline __device__ float dist_from_vec(vec2& v) {
         const float addx = (x + v.x);
         const float addy = (y + v.y);
-        return sqrtf(addx*addx + addy*addy);
+        return __fsqrt_rn(__fmaf_rn(addx,addx,addy*addy));
     }
 };
 
@@ -96,6 +101,10 @@ struct vec3 {
     inline __host__ __device__ vec3 normalize() {
         const float scl = matgnitude((*this));
         return vec3(x / scl, y / scl, z / scl);
+    }
+
+    inline __host__ __device__ bool operator==(const vec3& f) const {
+        return fabs(x - f.x) < 0.001f && fabs(y - f.y) < 0.001f && fabs(z - f.z) < 0.001f;
     }
 
     inline __host__ __device__ vec2 convert_vec2() {
@@ -165,16 +174,12 @@ struct triangle2D {
         p1 = P1; p2 = P2; p3 = P3;
     }
 
-    inline __host__ __device__ barycentric_return point_in_triangle(const vec2 p, int seed) const {
+    inline __device__ barycentric_return point_in_triangle(const vec2 p, int seed) const {
         const float x3m = p.x - p3.x;
         const float y3m = p.y - p3.y;
 
-        const float a = (y2_y3 * x3m + x3_x2 * y3m) / denom;
-        const float b = (y3_y1 * x3m + x1_x3 * y3m) / denom;
-        const float c = 1.0f - a - b;
-
         barycentric_return r;
-        r.a = a; r.b = b; r.c = c;
+        r.a = (y2_y3 * x3m + x3_x2 * y3m) / denom; r.b = (y3_y1 * x3m + x1_x3 * y3m) / denom; r.c = 1.0f - r.a - r.b;
         return r;
     }
 };
@@ -232,7 +237,14 @@ __device__ float depth_buffer[scr_w * scr_h];
 // global device array of all triangles
 __device__ char triangles[sizeof(triangle) * num_triangles];
 
-__global__ void fillPixels(color c, triangle2D t2D, const vec3 z_coords) {
+// vertex norms
+__constant__ char vertex_norms[sizeof(vec3) * num_triangles * 3];
+
+typedef struct {
+    vec3 v1, v2, v3;
+}triplevec3;
+
+__global__ void fillPixels(color c, triangle2D t2D, const vec3 z_coords, const triplevec3 n) {
     const int id = threadIdx.x + blockIdx.x * blockDim.x;
 
     const int tmp = (t2D.bound_box.max.x - t2D.bound_box.min.x);
@@ -244,23 +256,32 @@ __global__ void fillPixels(color c, triangle2D t2D, const vec3 z_coords) {
 
     const barycentric_return r = t2D.point_in_triangle(vec2(x, y), 10 * id);
 
-    const float z = z_coords.x * r.a + z_coords.y * r.b + z_coords.z * r.c;
+    const float z = __fmaf_rn(z_coords.x, r.a, __fmaf_rn(z_coords.y, r.b, z_coords.z * r.c));
+
+    const vec3 pos = vec3(v.x, v.y, z);
 
     const float d = depth_buffer[x + y * scr_w];
 
-    if (r.a >= -0.001f && r.b >= -0.001f && r.c >= -0.001f && (d == 0 || d > z)) {
+    const vec3 interpolated_norm = vec3(__fmaf_rn(n.v1.x, r.a, __fmaf_rn(n.v2.x, r.b, n.v3.x * r.c)), __fmaf_rn(n.v1.y, r.a, __fmaf_rn(n.v2.y, r.b, n.v3.y * r.c)), __fmaf_rn(n.v1.z, r.a, __fmaf_rn(n.v2.z, r.b, n.v3.z * r.c)));
+
+    if (r.a >= -0.02f && r.b >= -0.02f && r.c >= -0.02f && (d == 0 || d > z)) {
         //((color*)screen_buffer)[x + y * scr_w] = color(r.a, r.b, r.c);
         depth_buffer[x + y * scr_w] = z;
-        ((color*)screen_buffer)[x + y * scr_w] = color(1.0f, z / 30.0f, z / 30.0f);
+        //((color*)screen_buffer)[x + y * scr_w] = color(1.0f, (z-22) / 20.0f, (z-22) / 20.0f);
+        ((color*)screen_buffer)[x + y * scr_w] = color(interpolated_norm.x, interpolated_norm.y, interpolated_norm.z);
     }
 }
 
-__device__ void fillPixel(const int id, const int minx, const int maxx, const int miny, const int maxy, color c, triangle2D t2D, const vec3 z_coords) {
+inline __device__ void fillPixel(const int id, const int minx, const int maxx, const int miny, const int maxy, color c, triangle2D t2D, const vec3 z_coords, vec3 nv, const int t_id) {
 
     const int x = id % (maxx - minx) + minx;
     const int y = id / (maxx - minx) + miny;
 
     vec2 v = vec2(x, y);
+
+    const vec3 na = ((vec3*)vertex_norms)[t_id * 3];
+    const vec3 nb = ((vec3*)vertex_norms)[t_id * 3+1];
+    const vec3 nc = ((vec3*)vertex_norms)[t_id * 3+2];
 
     const barycentric_return r = t2D.point_in_triangle(vec2(x, y), 10 * id);
 
@@ -270,8 +291,10 @@ __device__ void fillPixel(const int id, const int minx, const int maxx, const in
 
     depth_buffer[x + y * scr_w] = (d == 0) * z + (d > z) * z + (d != 0 && d > z) * d;
 
+    const vec3 interpolated_norm = na * r.a + nb * r.b + nc * r.c;
+
     if (r.a >= -0.01f && r.b >= -0.01f && r.c >= -0.01f) {
-        ((color*)screen_buffer)[x + y * scr_w] = color(1.0f, z / 10.0f, z / 10.0f);
+        ((color*)screen_buffer)[x + y * scr_w] = color(interpolated_norm.x, interpolated_norm.x, interpolated_norm.x);
     }
 }
 
@@ -290,15 +313,18 @@ __global__ void rasterize_triangles_single_thread(color c) {
 
     const vec3 z_coords = vec3(t.p1.z, t.p2.z, t.p3.z);
 
+    const triplevec3 n = ((triplevec3*)vertex_norms)[index];
+
     const int p_minx = (int)t2D.bound_box.min.x;
     const int p_miny = (int)t2D.bound_box.min.y;
     const int p_maxx = (int)t2D.bound_box.max.x;
     const int p_maxy = (int)t2D.bound_box.max.y;
 
-    fillPixels << <512, (p_maxx - p_minx) * (p_maxy - p_miny) / 512+1 >> > (c, t2D, z_coords);
+
+    fillPixels << <32, (p_maxx - p_minx) * (p_maxy - p_miny) / 32+1 >> > (c, t2D, z_coords, n);
 }
 
-#define threads_rasterization 1024
+#define threads_rasterization 512
 
 int clamp(int i) {
     return (i < max_streams) ? i : max_streams;
@@ -334,7 +360,16 @@ void add_triangle(vec3 p1, vec3 p2, vec3 p3, int idx) {
     cudaMemcpyToSymbol(triangles, &t, sizeof(triangle), sizeof(triangle) * idx);
 }
 
-void loadRawModel(const char* filename, int start_idx = 0) {
+vec3 computeNorm(vec3 p1, vec3 p2, vec3 p3) {
+    return cross(p1 - p2, p1 - p3).normalize();
+}
+
+void loadRawModel(const char* filename, int start_idx) {
+    vec3* vertexNorms = (vec3*)calloc(num_triangles * 3, sizeof(vec3));
+
+    vec3 verts[num_triangles * 3];
+    vec3 facetNorms[num_triangles];
+
     std::ifstream file(filename, std::ios::binary);
     if (!file) {
         std::cerr << "Unable to open file: " << filename << std::endl;
@@ -349,8 +384,12 @@ void loadRawModel(const char* filename, int start_idx = 0) {
         file.read(reinterpret_cast<char*>(&vertices[1]), sizeof(vec3));
         file.read(reinterpret_cast<char*>(&vertices[2]), sizeof(vec3));
 
-        for (int i2 = 0; i2 < 3; i2++) { float tmp = vertices[i2].z; vertices[i2].z = vertices[i2].y + 45.0f; vertices[i2].y = tmp; }
+        for (int i2 = 0; i2 < 3; i2++) { float tmp = vertices[i2].z; vertices[i2].z = vertices[i2].y + 60.0f; vertices[i2].y = tmp; }
 
+        verts[i * 3] = vertices[0];
+        verts[i * 3 + 1] = vertices[1];
+        verts[i * 3 + 2] = vertices[2];
+        facetNorms[i] = computeNorm(vertices[0], vertices[1], vertices[2]);
         if (!file.eof()) {
             add_triangle(vertices[0], vertices[1], vertices[2], start_idx + i);
             ++i;
@@ -358,6 +397,22 @@ void loadRawModel(const char* filename, int start_idx = 0) {
     }
 
     file.close();
+
+    for (int n = 0; n < num_triangles*3; n++) {
+        for (int v2 = 0; v2 < num_triangles * 3; v2++) {
+            if (verts[v2] == verts[n]) {
+                vertexNorms[v2] = vertexNorms[v2] + facetNorms[n/3];
+            }
+        }
+    }
+
+    for (int i = 0; i < num_triangles * 3; i++) {
+        vertexNorms[i].normalize();
+        //printf("%f %f %f\n", vertexNorms[i].x, vertexNorms[i].y, vertexNorms[i].z);
+    }
+
+    cudaMemcpyToSymbol(vertex_norms, vertexNorms, sizeof(vec3) * num_triangles * 3);
+    free(vertexNorms);
 }
 
 
@@ -412,7 +467,9 @@ int main()
 {
     // add triangles
     
-    loadRawModel("C:\\Users\\david\\Downloads\\pythonAndModels\\raw_model.raw");
+    for (int i = 0; i < 1; i++) {
+        loadRawModel("C:\\Users\\david\\Downloads\\pythonAndModels\\raw_model.raw", i * 207);
+    }
 
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -528,7 +585,9 @@ int main()
         int ind = 0;
         // **
         // dodaj boje tu u pixels
-        rasterize_all_triangles(color(1.0f, 0.0f, 0.0f));
+        for (int i = 0; i < 1000; i++) {
+            rasterize_all_triangles(color(1.0f, 0.0f, 0.0f));
+        }
         copyBufferToCPU();
         // **
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, scr_w, scr_h, 0, GL_RGB, GL_FLOAT, cpu_colors);
@@ -545,17 +604,33 @@ int main()
         glfwSwapBuffers(window);
         glfwPollEvents();
         cudaDeviceSynchronize();
-        if (frame % 10 == 1) {
+        /*if (frame % 10 == 1) {
             int fps = 10000 / (frametime);
-            printf("%d\n", fps);
+            //printf("%d\n", fps);
+            if (fps < 10) {
+                printf("\rFPS: 000%d", fps);
+            }
+            if (fps < 100) {
+                printf("\rFPS: 00%d", fps);
+            }
+            else if (fps < 1000) {
+                printf("\rFPS: 0%d", fps);
+            }
+
+            else {
+                printf("\rFPS: %d", fps);
+            }
             frametime = 0;
-        }
+        }*/
+        
+        
         cudaDeviceSynchronize();
         cudaEventRecord(end);
         frame++;
         float milis;
         cudaEventElapsedTime(&milis, start, end);
         frametime += milis;
+        printf("%f\n", milis);
         printLastErrorCUDA()
     }
     glDeleteVertexArrays(1, &VAO);
