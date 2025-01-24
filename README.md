@@ -16,6 +16,7 @@ first model rendered!!(low-poly knight figure from chess):
 ![image](https://github.com/user-attachments/assets/c112f982-3be8-45be-b9c2-6a451f255699)
 
 
-depth mask of said model: ![image](https://github.com/user-attachments/assets/cf77ef04-c988-40ea-a63d-1255bd15e275)
+depth mask of said model: ![image](https://github.com/user-attachments/assets/c3fd2f56-fbcb-41bd-84e4-0446de47cc71)
+
 
 
