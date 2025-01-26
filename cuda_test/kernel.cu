@@ -18,6 +18,7 @@
 #include <list>
 #include <algorithm>
 #include <cuda_fp16.h>
+#include <thread>
 
 #define fov 0.0035f
 #define scr_w 512
@@ -32,6 +33,7 @@ cudaError_t err;
 #define printLastErrorCUDA() err = cudaGetLastError(); if(err != cudaSuccess){printf("%s\n",cudaGetErrorString(err));}
 
 #define dot(vec3_v1, vec3_v2) (vec3_v1.x * vec3_v2.x + vec3_v1.y * vec3_v2.y + vec3_v1.z * vec3_v2.z)
+#define dot_fastmath(vec3_v1, vec3_v2) __fmaf_rn(vec3_v1.x, vec3_v2.x,__fmaf_rn(vec3_v1.y, vec3_v2.y,vec3_v1.z * vec3_v2.z))
 #define dot2D(vec2_v1, vec2_v2) (vec2_v1.x * vec2_v2.x + vec2_v1.y * vec2_v2.y)
 #define matrix2D_eval(float_a , float_b, float_c, float_d) (float_a*float_d - float_b*float_c)
 #define matgnitude(vec3_a) (sqrtf(dot(vec3_a, vec3_a)))
@@ -104,10 +106,10 @@ struct vec3 {
     }
 
     inline __host__ __device__ bool operator==(const vec3& f) const {
-        return fabs(x - f.x) < 0.001f && fabs(y - f.y) < 0.001f && fabs(z - f.z) < 0.001f;
+        return fabs(x - f.x) < 0.01f && fabs(y - f.y) < 0.01f && fabs(z - f.z) < 0.01f;
     }
 
-    inline __host__ __device__ vec2 convert_vec2() {
+    inline __host__ __device__ vec2 convert_vec2() const {
         return vec2(x / (z * fov), y / (z * fov));
     }
 };
@@ -122,18 +124,10 @@ inline __host__ __device__ vec3 cross(const vec3 v1, const vec3 v2) {
     return ret;
 }
 
-inline __host__ __device__ float get_max(float f1, float f2) {
-    return (f1 > f2) * f1 + (f1 <= f2) * f2;
-}
-
-inline __host__ __device__ float get_min(float f1, float f2) {
-    return (f1 < f2) * f1 + (f1 >= f2) * f2;
-}
-
 struct bounding_box{
     vec2 min, max;
 
-    __host__ __device__ bounding_box(){}
+    __device__ bounding_box(){}
 
     __host__ __device__ bounding_box(const float minx, const float maxx, const float miny, const float maxy) : min(vec2(minx, miny)), max(vec2(maxx, maxy)){}
 };
@@ -150,22 +144,22 @@ struct triangle2D {
     __host__ __device__ triangle2D() {}
 
     inline __host__ __device__ void calc_denom_and_vals() {
-        denom = (p2.y - p3.y) * (p1.x - p3.x) + (p3.x - p2.x) * (p1.y - p3.y);
-        y2_y3 = p2.y - p3.y;
-        x1_x3 = p1.x - p3.x;
-        x3_x2 = p3.x - p2.x;
-        y3_y1 = p3.y - p1.y;
-        float minx = get_min(p1.x, p2.x);
-        minx = get_min(minx, p3.x);
+        denom = 1.0f/((p2.y - p3.y) * (p1.x - p3.x) + (p3.x - p2.x) * (p1.y - p3.y));
+        y2_y3 = (p2.y - p3.y) * denom;
+        x1_x3 = (p1.x - p3.x) * denom;
+        x3_x2 = (p3.x - p2.x) * denom;
+        y3_y1 = (p3.y - p1.y) * denom;
+        float minx = fminf(p1.x, p2.x);
+        minx = fminf(minx, p3.x);
 
-        float maxx = get_max(p1.x, p2.x);
-        maxx = get_max(maxx, p3.x);
+        float maxx = fmaxf(p1.x, p2.x);
+        maxx = fmaxf(maxx, p3.x);
 
-        float miny = get_min(p1.y, p2.y);
-        miny = get_min(miny, p3.y);
+        float miny = fminf(p1.y, p2.y);
+        miny = fminf(miny, p3.y);
 
-        float maxy = get_max(p1.y, p2.y);
-        maxy = get_max(maxy, p3.y);
+        float maxy = fmaxf(p1.y, p2.y);
+        maxy = fmaxf(maxy, p3.y);
 
         bound_box = bounding_box(minx, maxx, miny, maxy);
     }
@@ -179,7 +173,7 @@ struct triangle2D {
         const float y3m = p.y - p3.y;
 
         barycentric_return r;
-        r.a = (y2_y3 * x3m + x3_x2 * y3m) / denom; r.b = (y3_y1 * x3m + x1_x3 * y3m) / denom; r.c = 1.0f - r.a - r.b;
+        r.a = (y2_y3 * x3m + x3_x2 * y3m); r.b = (y3_y1 * x3m + x1_x3 * y3m); r.c = 1.0f - r.a - r.b;
         return r;
     }
 };
@@ -205,7 +199,7 @@ struct triangle {
         nv = cross(sb21, sb31).normalize();
     }
 
-    inline __host__ __device__ triangle2D convert_to_2D() {
+    inline __host__ __device__ triangle2D convert_to_2D() const {
         return triangle2D(p1.convert_vec2(), p2.convert_vec2(), p3.convert_vec2());
     }
 };
@@ -256,13 +250,13 @@ __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3
 
     const float z = __fmaf_rn(z_coords.x, r.a, __fmaf_rn(z_coords.y, r.b, z_coords.z * r.c));
 
-    const vec3 pos = vec3(x, y, z);
-
     const float d = depth_buffer[x + y * scr_w];
 
     const vec3 interpolated_norm = vec3(__fmaf_rn(n.v1.x, r.a, __fmaf_rn(n.v2.x, r.b, n.v3.x * r.c)), __fmaf_rn(n.v1.y, r.a, __fmaf_rn(n.v2.y, r.b, n.v3.y * r.c)), __fmaf_rn(n.v1.z, r.a, __fmaf_rn(n.v2.z, r.b, n.v3.z * r.c)));
+    
 
-    if (!(r.a >= -0.02f && r.b >= -0.02f && r.c >= -0.02f && (d == 0 || d > z))) {
+
+    if (!(r.a >= -0.0f && r.b >= -0.0f && r.c >= -0.0f && (d == 0 || d > z))) {
         return;
     }
     //((color*)screen_buffer)[x + y * scr_w] = color(r.a, r.b, r.c);
@@ -271,37 +265,11 @@ __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3
     ((color*)screen_buffer)[x + y * scr_w] = color(interpolated_norm.x, interpolated_norm.y, interpolated_norm.z);
 }
 
-inline __device__ void fillPixel(const int id, const int minx, const int maxx, const int miny, const int maxy, color c, triangle2D t2D, const vec3 z_coords, vec3 nv, const int t_id) {
-
-    const int x = id % (maxx - minx) + minx;
-    const int y = id / (maxx - minx) + miny;
-
-    vec2 v = vec2(x, y);
-
-    const vec3 na = ((vec3*)vertex_norms)[t_id * 3];
-    const vec3 nb = ((vec3*)vertex_norms)[t_id * 3+1];
-    const vec3 nc = ((vec3*)vertex_norms)[t_id * 3+2];
-
-    const barycentric_return r = t2D.point_in_triangle(vec2(x, y), 10 * id);
-
-    const float z = z_coords.x * r.a + z_coords.y * r.b + z_coords.z * r.c;
-
-    const float d = depth_buffer[x + y * scr_w];
-
-    depth_buffer[x + y * scr_w] = (d == 0) * z + (d > z) * z + (d != 0 && d > z) * d;
-
-    const vec3 interpolated_norm = na * r.a + nb * r.b + nc * r.c;
-
-    if (r.a >= -0.01f && r.b >= -0.01f && r.c >= -0.01f) {
-        ((color*)screen_buffer)[x + y * scr_w] = color(interpolated_norm.x, interpolated_norm.x, interpolated_norm.x);
-    }
-}
-
 // rasterization function tests
 __global__ void rasterize_triangles_single_thread() {
     const int index = threadIdx.x + blockIdx.x * blockDim.x;
     if (index >= num_triangles) { return; }
-    triangle t = ((triangle*)triangles)[index];
+    const triangle t = ((triangle*)triangles)[index];
     triangle2D t2D = t.convert_to_2D();
 
     const vec2 tmp = vec2(scr_w / 2, scr_h / 2);
@@ -313,6 +281,43 @@ __global__ void rasterize_triangles_single_thread() {
     t2D.calc_denom_and_vals();
 
     fillPixels << <32, ((int)t2D.bound_box.max.x - (int)t2D.bound_box.min.x) * ((int)t2D.bound_box.max.y - (int)t2D.bound_box.min.y) / 32 + 1 >> > (t2D, vec3(t.p1.z, t.p2.z, t.p3.z), ((triplevec3*)vertex_norms)[index]);
+}
+
+// rasterization with cpu-gpu load distribution. useful if system doesnt support nested kernels
+
+triangle trianglesCPU[num_triangles];
+
+void rasterizeTrianglesThread(const int threadId, const int trianglesToInit, const int start_idx) {
+    for (int tind = start_idx; tind < start_idx + trianglesToInit; tind++) {
+        triangle2D t2D = trianglesCPU[tind].convert_to_2D();
+        triangle t = trianglesCPU[tind];
+        const vec2 tmp = vec2(scr_w / 2, scr_h / 2);
+
+        t2D.p1 = t2D.p1 + tmp;
+        t2D.p2 = t2D.p2 + tmp;
+        t2D.p3 = t2D.p3 + tmp;
+        t2D.calc_denom_and_vals();
+
+        triplevec3 tv3;
+        cudaMemcpyFromSymbol(&tv3, vertex_norms, sizeof(triplevec3), tind * sizeof(triplevec3));
+
+        fillPixels << <32, ((int)t2D.bound_box.max.x - (int)t2D.bound_box.min.x)* ((int)t2D.bound_box.max.y - (int)t2D.bound_box.min.y) / 32 + 1 >> > (t2D, vec3(t.p1.z, t.p2.z, t.p3.z), tv3);
+    }
+}
+
+void rasterizeAllTrianglesCPUandGPU() {
+    const int threadLimit = std::thread::hardware_concurrency();
+    int triangles_called = 0;
+
+    const int trianglesPerThread = num_triangles / threadLimit + 1;
+
+    const int num_calls = num_triangles / threadLimit + 1;
+    std::vector<std::thread> threads(num_calls);
+    for (int c = 0; c < num_calls; c++) {
+        int trianglesToRender = num_triangles < (triangles_called + trianglesPerThread) ? trianglesPerThread : num_triangles - triangles_called;
+        //threads[c] = std::thread(rasterizeTrianglesThread, c, );
+        triangles_called += trianglesToRender;
+    }
 }
 
 #define threads_rasterization 256
@@ -354,7 +359,7 @@ vec3 computeNorm(vec3 p1, vec3 p2, vec3 p3) {
     return cross(p1 - p2, p1 - p3).normalize();
 }
 
-void loadRawModel(const char* filename, int start_idx) {
+void loadRawModel(const char* filename, const char* filenameNorm, int start_idx) {
     vec3* vertexNorms = (vec3*)calloc(num_triangles * 3, sizeof(vec3));
 
     vec3 verts[num_triangles * 3];
@@ -379,14 +384,39 @@ void loadRawModel(const char* filename, int start_idx) {
         verts[i * 3] = vertices[0];
         verts[i * 3 + 1] = vertices[1];
         verts[i * 3 + 2] = vertices[2];
-        facetNorms[i] = computeNorm(vertices[0], vertices[1], vertices[2]);
         if (!file.eof()) {
             add_triangle(vertices[0], vertices[1], vertices[2], start_idx + i);
-            ++i;
+            i++;
         }
     }
 
     file.close();
+
+    std::ifstream fileNorm(filenameNorm);
+
+    if (!fileNorm) {
+        std::cerr << "Unable to open normal vector file: " << filenameNorm << std::endl;
+        return;
+    }
+
+    i = 0;
+    std::string line;
+    while (std::getline(fileNorm, line)) {
+        std::stringstream ss(line);
+        vec3 n;
+        ss >> n.x >> n.y >> n.z;
+
+        if (i < num_triangles) {
+            facetNorms[i] = n.normalize();
+            i++;
+        }
+        else {
+            std::cerr << "More normals than expected. Stopping read." << std::endl;
+            break;
+        }
+    }
+
+    fileNorm.close();
 
     for (int n = 0; n < num_triangles*3; n++) {
         for (int v2 = 0; v2 < num_triangles * 3; v2++) {
@@ -458,7 +488,7 @@ int main()
     // add triangles
     
     for (int i = 0; i < 1; i++) {
-        loadRawModel("C:\\Users\\david\\Downloads\\pythonAndModels\\raw_model.raw", i * 207);
+        loadRawModel("C:\\Users\\david\\Downloads\\pythonAndModels\\raw_model.raw", "C:\\Users\\david\\Downloads\\pythonAndModels\\norm_vecs.txt", i * 207);
     }
 
     glfwInit();
@@ -572,10 +602,9 @@ int main()
         processInput(window);
         glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
         //glClear(GL_COLOR_BUFFER_BIT);
-        int ind = 0;
         // **
         // dodaj boje tu u pixels
-        for (int i = 0; i < 1000; i++) {
+        for (int i = 0; i < 100; i++) {
             rasterize_all_triangles();
         }
         copyBufferToCPU();
@@ -593,6 +622,7 @@ int main()
 
         glfwSwapBuffers(window);
         glfwPollEvents();
+        goto skp;
         if (frame % 10 == 1) {
             int fps = 10000 / (frametime);
             //printf("%d\n", fps);
@@ -611,7 +641,7 @@ int main()
             }
             frametime = 0;
         }
-        
+        skp:
         
         cudaDeviceSynchronize();
         cudaEventRecord(end);
@@ -619,7 +649,7 @@ int main()
         float milis;
         cudaEventElapsedTime(&milis, start, end);
         frametime += milis;
-        //printf("%f\n", milis);
+        printf("%f\n", milis);
         printLastErrorCUDA()
     }
     glDeleteVertexArrays(1, &VAO);
