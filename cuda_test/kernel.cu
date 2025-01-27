@@ -1,5 +1,6 @@
 ﻿
 #include "cuda_runtime.h"
+#include "cuda_device_runtime_api.h"
 #include "device_launch_parameters.h"
 #include <math.h>
 #include <stdio.h>
@@ -258,7 +259,8 @@ __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3
 
     const float z = __fmaf_rn(z_coords.x, r.a, __fmaf_rn(z_coords.y, r.b, z_coords.z * r.c));
 
-    const float d = depth_buffer[x + y * scr_w];
+    float d;
+    atomicExch(&d, depth_buffer[x + y * scr_w]);
 
     if (!(r.a >= scl && r.b >= scl && r.c >= scl && (d == 0 || d > z))) {
         return;
@@ -266,7 +268,8 @@ __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3
 
     const vec3 interpolated_norm = vec3(__fmaf_rn(n.v1.x, r.a, __fmaf_rn(n.v2.x, r.b, n.v3.x * r.c)), __fmaf_rn(n.v1.y, r.a, __fmaf_rn(n.v2.y, r.b, n.v3.y * r.c)), __fmaf_rn(n.v1.z, r.a, __fmaf_rn(n.v2.z, r.b, n.v3.z * r.c)));
     //((color*)screen_buffer)[x + y * scr_w] = color(r.a, r.b, r.c);
-    depth_buffer[x + y * scr_w] = z;
+    atomicExch(&(depth_buffer[x + y * scr_w]), z);
+    //depth_buffer[x + y * scr_w] = z;
     //((color*)screen_buffer)[x + y * scr_w] = color(1.0f, (z-22) / 20.0f, (z-22) / 20.0f);
     ((color*)screen_buffer)[x + y * scr_w] = color(interpolated_norm.x, interpolated_norm.y, interpolated_norm.z);
 }
@@ -286,7 +289,10 @@ __global__ void rasterize_triangles_single_thread() {
     
     t2D.calc_denom_and_vals();
 
+    __syncthreads();
     fillPixels << <32, ((int)t2D.bound_box.max.x - (int)t2D.bound_box.min.x) * ((int)t2D.bound_box.max.y - (int)t2D.bound_box.min.y) / 32 + 1 >> > (t2D, vec3(t.p1.z, t.p2.z, t.p3.z), ((triplevec3*)vertex_norms)[index]);
+    
+
 }
 
 // rasterization with cpu-gpu load distribution. useful if system doesnt support nested kernels
