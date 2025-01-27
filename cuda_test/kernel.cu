@@ -238,6 +238,10 @@ typedef struct {
     vec3 v1, v2, v3;
 }triplevec3;
 
+inline __device__ float barycentric_float_interpolation(const vec3 floats, const barycentric_return r) {
+    return floats.x * r.a + floats.y * r.b + floats.z * r.c;
+}
+
 __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3 n) {
     const int id = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -250,18 +254,17 @@ __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3
 
     const barycentric_return r = t2D.point_in_triangle(vec2(x, y), 10 * id);
 
+    const float scl = -1.0f / ((tmp < tmp2) * tmp + (tmp > tmp2) * tmp2);
+
     const float z = __fmaf_rn(z_coords.x, r.a, __fmaf_rn(z_coords.y, r.b, z_coords.z * r.c));
 
     const float d = depth_buffer[x + y * scr_w];
 
-    const vec3 interpolated_norm = vec3(__fmaf_rn(n.v1.x, r.a, __fmaf_rn(n.v2.x, r.b, n.v3.x * r.c)), __fmaf_rn(n.v1.y, r.a, __fmaf_rn(n.v2.y, r.b, n.v3.y * r.c)), __fmaf_rn(n.v1.z, r.a, __fmaf_rn(n.v2.z, r.b, n.v3.z * r.c)));
-    
-    const float scl = -1.0f / ((tmp < tmp2) * tmp + (tmp > tmp2) * tmp2);
-
-    
     if (!(r.a >= scl && r.b >= scl && r.c >= scl && (d == 0 || d > z))) {
         return;
     }
+
+    const vec3 interpolated_norm = vec3(__fmaf_rn(n.v1.x, r.a, __fmaf_rn(n.v2.x, r.b, n.v3.x * r.c)), __fmaf_rn(n.v1.y, r.a, __fmaf_rn(n.v2.y, r.b, n.v3.y * r.c)), __fmaf_rn(n.v1.z, r.a, __fmaf_rn(n.v2.z, r.b, n.v3.z * r.c)));
     //((color*)screen_buffer)[x + y * scr_w] = color(r.a, r.b, r.c);
     depth_buffer[x + y * scr_w] = z;
     //((color*)screen_buffer)[x + y * scr_w] = color(1.0f, (z-22) / 20.0f, (z-22) / 20.0f);
@@ -309,7 +312,7 @@ void rasterizeTrianglesThread(const int threadId, const int trianglesToInit, con
 }
 
 void rasterizeAllTrianglesCPUandGPU() {
-    const int threadLimit = std::thread::hardware_concurrency();
+    const int threadLimit = std::thread::hardware_concurrency() * 20;
     int triangles_called = 0;
 
     const int trianglesPerThread = num_triangles / threadLimit + 1;
@@ -318,8 +321,11 @@ void rasterizeAllTrianglesCPUandGPU() {
     std::vector<std::thread> threads(num_calls);
     for (int c = 0; c < num_calls; c++) {
         int trianglesToRender = num_triangles < (triangles_called + trianglesPerThread) ? trianglesPerThread : num_triangles - triangles_called;
-        //threads[c] = std::thread(rasterizeTrianglesThread, c, );
+        threads[c] = std::thread(rasterizeTrianglesThread, c, trianglesToRender, triangles_called);
         triangles_called += trianglesToRender;
+    }
+    for (int c = 0; c < num_calls; c++) {
+        threads[c].join();
     }
 }
 
@@ -349,8 +355,19 @@ void rasterize_all_triangles_multi_thread() {
 }
 */
 
-void rasterize_all_triangles() {
-    rasterize_triangles_single_thread << <threads_rasterization, num_triangles / threads_rasterization + 1 >> > ();
+void rasterize_all_triangles(bool cpu_used) {
+    float* d_depth_buffer;
+    cudaGetSymbolAddress((void**)&d_depth_buffer, depth_buffer);
+
+    if (cpu_used) {
+        rasterizeAllTrianglesCPUandGPU();
+    }
+    else {
+        rasterize_triangles_single_thread << <threads_rasterization, num_triangles / threads_rasterization + 1 >> > ();
+    }
+    cudaDeviceSynchronize();
+    
+    cudaMemset(d_depth_buffer, 0, sizeof(float) * scr_w * scr_h);
 }
 
 void add_triangle(vec3 p1, vec3 p2, vec3 p3, int idx) {
@@ -494,6 +511,8 @@ int main()
         loadRawModel("C:\\Users\\david\\Downloads\\pythonAndModels\\raw_model.raw", "C:\\Users\\david\\Downloads\\pythonAndModels\\norm_vecs.txt", i * 207);
     }
 
+    cudaMemcpyFromSymbol(trianglesCPU, triangles, sizeof(triangle) * num_triangles);
+
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -607,8 +626,8 @@ int main()
         //glClear(GL_COLOR_BUFFER_BIT);
         // **
         // dodaj boje tu u pixels
-        for (int i = 0; i < 100; i++) {
-            rasterize_all_triangles();
+        for (int i = 0; i < 1; i++) {
+            rasterize_all_triangles(false);
         }
         copyBufferToCPU();
         // **
@@ -646,7 +665,6 @@ int main()
         }
         skp:
         
-        cudaDeviceSynchronize();
         cudaEventRecord(end);
         frame++;
         float milis;
