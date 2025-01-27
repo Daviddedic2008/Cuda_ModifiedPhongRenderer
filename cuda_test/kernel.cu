@@ -161,7 +161,7 @@ struct triangle2D {
         float maxy = fmaxf(p1.y, p2.y);
         maxy = fmaxf(maxy, p3.y);
 
-        bound_box = bounding_box(minx, maxx, miny, maxy);
+        bound_box = bounding_box(minx-1, maxx+1, miny-1, maxy+1);
     }
 
     __host__ __device__ triangle2D(const vec2 P1, const vec2 P2, const vec2 P3) {
@@ -243,6 +243,8 @@ __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3
 
     const int tmp = (t2D.bound_box.max.x - t2D.bound_box.min.x);
 
+    const int tmp2 = (t2D.bound_box.max.y - t2D.bound_box.min.y);
+
     const int x = id % tmp + t2D.bound_box.min.x;
     const int y = id / tmp + t2D.bound_box.min.y;
 
@@ -254,9 +256,10 @@ __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3
 
     const vec3 interpolated_norm = vec3(__fmaf_rn(n.v1.x, r.a, __fmaf_rn(n.v2.x, r.b, n.v3.x * r.c)), __fmaf_rn(n.v1.y, r.a, __fmaf_rn(n.v2.y, r.b, n.v3.y * r.c)), __fmaf_rn(n.v1.z, r.a, __fmaf_rn(n.v2.z, r.b, n.v3.z * r.c)));
     
+    const float scl = -1.0f / ((tmp < tmp2) * tmp + (tmp > tmp2) * tmp2);
 
-
-    if (!(r.a >= -0.0f && r.b >= -0.0f && r.c >= -0.0f && (d == 0 || d > z))) {
+    
+    if (!(r.a >= scl && r.b >= scl && r.c >= scl && (d == 0 || d > z))) {
         return;
     }
     //((color*)screen_buffer)[x + y * scr_w] = color(r.a, r.b, r.c);
