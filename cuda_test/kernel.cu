@@ -182,9 +182,6 @@ struct triangle2D {
 
 struct triangle {
     vec3 p1, p2, p3;
-    vec3 nv;
-    vec3 sb21, sb31;
-    float dot2121, dot2131, dot3131;
 
     __host__ __device__ triangle() : p1(vec3(0.0f, 0.0f, 0.0f)), p2(vec3(0.0f, 0.0f, 0.0f)), p3(vec3(0.0f, 0.0f, 0.0f)) {}
 
@@ -192,12 +189,6 @@ struct triangle {
         p1 = P1;
         p2 = P2;
         p3 = P3;
-        sb21 = p2 - p1;
-        sb31 = p3 - p1;
-        dot2121 = dot(sb21, sb21);
-        dot2131 = dot(sb21, sb31);
-        dot3131 = dot(sb31, sb31);
-        nv = cross(sb21, sb31).normalize();
     }
 
     inline __host__ __device__ triangle2D convert_to_2D() const {
@@ -233,7 +224,9 @@ __device__ float depth_buffer[scr_w * scr_h];
 __device__ char triangles[sizeof(triangle) * num_triangles];
 
 // vertex norms
-__constant__ char vertex_norms[sizeof(vec3) * num_triangles * 3];
+__device__ char vertex_norms[sizeof(vec3) * num_triangles * 3];
+
+__device__ char facet_norms[sizeof(vec3) * num_triangles];
 
 typedef struct {
     vec3 v1, v2, v3;
@@ -248,19 +241,18 @@ __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3
 
     const int tmp = (t2D.bound_box.max.x - t2D.bound_box.min.x);
 
-    const int tmp2 = (t2D.bound_box.max.y - t2D.bound_box.min.y);
+    const int tmp2 = (t2D.bound_box.max.y - t2D.bound_box.min.y) / tmp;
 
     const int x = id % tmp + t2D.bound_box.min.x;
     const int y = id / tmp + t2D.bound_box.min.y;
 
     const barycentric_return r = t2D.point_in_triangle(vec2(x, y), 10 * id);
 
-    const float scl = -1.0f / ((tmp < tmp2) * tmp + (tmp > tmp2) * tmp2);
+    const float scl = -0.001;
 
     const float z = __fmaf_rn(z_coords.x, r.a, __fmaf_rn(z_coords.y, r.b, z_coords.z * r.c));
 
-    float d;
-    atomicExch(&d, depth_buffer[x + y * scr_w]);
+    const float d = depth_buffer[x + y * scr_w];
 
     if (!(r.a >= scl && r.b >= scl && r.c >= scl && (d == 0 || d > z))) {
         return;
@@ -278,6 +270,7 @@ __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3
 __global__ void rasterize_triangles_single_thread() {
     const int index = threadIdx.x + blockIdx.x * blockDim.x;
     if (index >= num_triangles) { return; }
+    if (((vec3*)facet_norms)[index].z < 0.0f) { return; }
     const triangle t = ((triangle*)triangles)[index];
     triangle2D t2D = t.convert_to_2D();
 
@@ -362,8 +355,8 @@ void rasterize_all_triangles_multi_thread() {
 */
 
 void rasterize_all_triangles(bool cpu_used) {
-    float* d_depth_buffer;
-    cudaGetSymbolAddress((void**)&d_depth_buffer, depth_buffer);
+    //float* d_depth_buffer;
+    //cudaGetSymbolAddress((void**)&d_depth_buffer, depth_buffer);
 
     if (cpu_used) {
         rasterizeAllTrianglesCPUandGPU();
@@ -373,16 +366,12 @@ void rasterize_all_triangles(bool cpu_used) {
     }
     cudaDeviceSynchronize();
     
-    cudaMemset(d_depth_buffer, 0, sizeof(float) * scr_w * scr_h);
+    //cudaMemset(d_depth_buffer, 0, sizeof(float) * scr_w * scr_h);
 }
 
 void add_triangle(vec3 p1, vec3 p2, vec3 p3, int idx) {
     triangle t = triangle(p1, p2, p3);
     cudaMemcpyToSymbol(triangles, &t, sizeof(triangle), sizeof(triangle) * idx);
-}
-
-vec3 computeNorm(vec3 p1, vec3 p2, vec3 p3) {
-    return cross(p1 - p2, p1 - p3).normalize();
 }
 
 void loadRawModel(const char* filename, const char* filenameNorm, int start_idx) {
@@ -433,7 +422,7 @@ void loadRawModel(const char* filename, const char* filenameNorm, int start_idx)
         ss >> n.x >> n.y >> n.z;
 
         if (i < num_triangles) {
-            facetNorms[i] = n.normalize();
+            facetNorms[i] = n;
             i++;
         }
         else {
@@ -458,6 +447,7 @@ void loadRawModel(const char* filename, const char* filenameNorm, int start_idx)
     }
 
     cudaMemcpyToSymbol(vertex_norms, vertexNorms, sizeof(vec3) * num_triangles * 3);
+    cudaMemcpyToSymbol(facet_norms, facetNorms, sizeof(vec3) * num_triangles);
     free(vertexNorms);
 }
 
