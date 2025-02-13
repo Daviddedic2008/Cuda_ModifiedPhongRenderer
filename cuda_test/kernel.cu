@@ -102,8 +102,8 @@ struct vec3 {
     }
 
     inline __host__ __device__ vec3 normalize() {
-        const float scl = matgnitude((*this));
-        return vec3(x / scl, y / scl, z / scl);
+        const float scl = 1/matgnitude((*this));
+        return vec3(x * scl, y * scl, z * scl);
     }
 
     inline __host__ __device__ bool operator==(const vec3& f) const {
@@ -241,48 +241,46 @@ __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3
 
     const int tmp = (t2D.bound_box.max.x - t2D.bound_box.min.x);
 
-    const int tmp2 = (t2D.bound_box.max.y - t2D.bound_box.min.y) / tmp;
-
     const int x = id % tmp + t2D.bound_box.min.x;
     const int y = id / tmp + t2D.bound_box.min.y;
 
     const barycentric_return r = t2D.point_in_triangle(vec2(x, y), 10 * id);
 
-    const float scl = -0.001;
-
     const float z = __fmaf_rn(z_coords.x, r.a, __fmaf_rn(z_coords.y, r.b, z_coords.z * r.c));
 
     const float d = depth_buffer[x + y * scr_w];
 
-    if (!(r.a >= scl && r.b >= scl && r.c >= scl && (d == 0 || d > z))) {
+    if ((d > 0.0f) && d < z) { return; }
+
+    
+
+    if (!(r.a >= -0.01 && r.b >= -0.01 && r.c >= -0.01)) {
         return;
     }
 
     const vec3 interpolated_norm = vec3(__fmaf_rn(n.v1.x, r.a, __fmaf_rn(n.v2.x, r.b, n.v3.x * r.c)), __fmaf_rn(n.v1.y, r.a, __fmaf_rn(n.v2.y, r.b, n.v3.y * r.c)), __fmaf_rn(n.v1.z, r.a, __fmaf_rn(n.v2.z, r.b, n.v3.z * r.c)));
     //((color*)screen_buffer)[x + y * scr_w] = color(r.a, r.b, r.c);
-    atomicExch(&(depth_buffer[x + y * scr_w]), z);
+    depth_buffer[x + y * scr_w] = z;
     //depth_buffer[x + y * scr_w] = z;
     //((color*)screen_buffer)[x + y * scr_w] = color(1.0f, (z-22) / 20.0f, (z-22) / 20.0f);
-    ((color*)screen_buffer)[x + y * scr_w] = color(interpolated_norm.x, interpolated_norm.y, interpolated_norm.z);
+    ((color*)screen_buffer)[x + y * scr_w] = color(interpolated_norm.x, interpolated_norm.y, interpolated_norm.z) * (5/z);
 }
 
 // rasterization function tests
 __global__ void rasterize_triangles_single_thread() {
     const int index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (index >= num_triangles) { return; }
-    if (((vec3*)facet_norms)[index].z < 0.0f) { return; }
+    //printf("a %f \n", ((vec3*)facet_norms)[index].z);
+    //if (index >= num_triangles || ((vec3*)facet_norms)[index].z > 1.0f) { return; }
     const triangle t = ((triangle*)triangles)[index];
     triangle2D t2D = t.convert_to_2D();
+    const vec2 tmpAdd = vec2(scr_w / 2, scr_h / 2);
 
-    const vec2 tmp = vec2(scr_w / 2, scr_h / 2);
-
-    t2D.p1 = t2D.p1 + tmp;
-    t2D.p2 = t2D.p2 + tmp;
-    t2D.p3 = t2D.p3 + tmp;
+    t2D.p1 = t2D.p1 + tmpAdd;
+    t2D.p2 = t2D.p2 + tmpAdd;
+    t2D.p3 = t2D.p3 + tmpAdd;
     
     t2D.calc_denom_and_vals();
 
-    __syncthreads();
     fillPixels << <32, ((int)t2D.bound_box.max.x - (int)t2D.bound_box.min.x) * ((int)t2D.bound_box.max.y - (int)t2D.bound_box.min.y) / 32 + 1 >> > (t2D, vec3(t.p1.z, t.p2.z, t.p3.z), ((triplevec3*)vertex_norms)[index]);
     
 
@@ -311,7 +309,7 @@ void rasterizeTrianglesThread(const int threadId, const int trianglesToInit, con
 }
 
 void rasterizeAllTrianglesCPUandGPU() {
-    const int threadLimit = std::thread::hardware_concurrency() * 20;
+    const int threadLimit = std::thread::hardware_concurrency();
     int triangles_called = 0;
 
     const int trianglesPerThread = num_triangles / threadLimit + 1;
@@ -334,29 +332,15 @@ int clamp(int i) {
     return (i < max_streams) ? i : max_streams;
 }
 
-// being worked on
-/*
-void rasterize_all_triangles_multi_thread() {
-    cudaStream_t streams[max_streams];
-
-    const int num_iterations = num_triangles / max_streams + 1;
-
-    int total_tris = 0;
-
-    for (int i = 0; i < num_iterations; i++) {
-        const int num_streams = clamp((num_triangles - total_tris));
-        total_tris += num_streams;
-        for (int s = 0; s < num_streams; s++) {
-            cudaStreamCreate(&streams[s]);
-            rasterize_triangle_multi_thread<<<512, >>>(s, color(1.0f, 0.0f, 0.0f));
-        }
-    }
+__global__ void depthBufferZero() {
+    depth_buffer[threadIdx.x + blockIdx.x * blockDim.x] = -1.0f;
 }
-*/
 
 void rasterize_all_triangles(bool cpu_used) {
-    //float* d_depth_buffer;
-    //cudaGetSymbolAddress((void**)&d_depth_buffer, depth_buffer);
+
+    //depthBufferZero << <1024, scr_w * scr_h / 1024 >> > ();
+
+    cudaDeviceSynchronize();
 
     if (cpu_used) {
         rasterizeAllTrianglesCPUandGPU();
@@ -365,13 +349,15 @@ void rasterize_all_triangles(bool cpu_used) {
         rasterize_triangles_single_thread << <threads_rasterization, num_triangles / threads_rasterization + 1 >> > ();
     }
     cudaDeviceSynchronize();
-    
-    //cudaMemset(d_depth_buffer, 0, sizeof(float) * scr_w * scr_h);
 }
 
 void add_triangle(vec3 p1, vec3 p2, vec3 p3, int idx) {
     triangle t = triangle(p1, p2, p3);
     cudaMemcpyToSymbol(triangles, &t, sizeof(triangle), sizeof(triangle) * idx);
+}
+
+vec3 computeNorm(vec3 p1, vec3 p2, vec3 p3) {
+    return cross(p1 - p2, p1 - p3);
 }
 
 void loadRawModel(const char* filename, const char* filenameNorm, int start_idx) {
@@ -394,13 +380,15 @@ void loadRawModel(const char* filename, const char* filenameNorm, int start_idx)
         file.read(reinterpret_cast<char*>(&vertices[1]), sizeof(vec3));
         file.read(reinterpret_cast<char*>(&vertices[2]), sizeof(vec3));
 
-        for (int i2 = 0; i2 < 3; i2++) { float tmp = vertices[i2].z; vertices[i2].z = vertices[i2].y + 60.0f; vertices[i2].y = tmp; }
+        for (int i2 = 0; i2 < 3; i2++) { vertices[i2].z += 60; }
 
         verts[i * 3] = vertices[0];
         verts[i * 3 + 1] = vertices[1];
         verts[i * 3 + 2] = vertices[2];
         if (!file.eof()) {
             add_triangle(vertices[0], vertices[1], vertices[2], start_idx + i);
+            //((vec3*)facetNorms)[i] = computeNorm(vertices[0], vertices[1], vertices[2]).normalize();
+            //printf("%f\n", vertices[2]);
             i++;
         }
     }
@@ -622,7 +610,7 @@ int main()
         //glClear(GL_COLOR_BUFFER_BIT);
         // **
         // dodaj boje tu u pixels
-        for (int i = 0; i < 1; i++) {
+        for (int i = 0; i < 1000; i++) {
             rasterize_all_triangles(false);
         }
         copyBufferToCPU();
