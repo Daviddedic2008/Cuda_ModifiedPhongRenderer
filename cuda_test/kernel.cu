@@ -7,7 +7,6 @@
 #include <stdlib.h>
 #include <time.h>
 #include <curand_kernel.h>
-#include <time.h>
 #include <glad/glad.h>
 #include <glfw3.h>
 #include <string.h>
@@ -18,7 +17,6 @@
 #include <vector>
 #include <list>
 #include <algorithm>
-#include <cuda_fp16.h>
 #include <thread>
 
 #define fov 0.0035f
@@ -250,7 +248,7 @@ __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3
 
     const float d = depth_buffer[x + y * scr_w];
 
-    if ((d > 0.0f) && d < z) { return; }
+    if ((d != 0.0f) && d < z) { return; }
 
     
 
@@ -270,8 +268,9 @@ __global__ void fillPixels(triangle2D t2D, const vec3 z_coords, const triplevec3
 __global__ void rasterize_triangles_single_thread() {
     const int index = threadIdx.x + blockIdx.x * blockDim.x;
     //printf("a %f \n", ((vec3*)facet_norms)[index].z);
-    //if (index >= num_triangles || ((vec3*)facet_norms)[index].z > 1.0f) { return; }
+    if (index >= num_triangles || ((vec3*)facet_norms)[index].z < 0.0f) { return; }
     const triangle t = ((triangle*)triangles)[index];
+
     triangle2D t2D = t.convert_to_2D();
     const vec2 tmpAdd = vec2(scr_w / 2, scr_h / 2);
 
@@ -387,8 +386,7 @@ void loadRawModel(const char* filename, const char* filenameNorm, int start_idx)
         verts[i * 3 + 2] = vertices[2];
         if (!file.eof()) {
             add_triangle(vertices[0], vertices[1], vertices[2], start_idx + i);
-            //((vec3*)facetNorms)[i] = computeNorm(vertices[0], vertices[1], vertices[2]).normalize();
-            //printf("%f\n", vertices[2]);
+            facetNorms[i] = computeNorm(vertices[0], vertices[1], vertices[2]).normalize();
             i++;
         }
     }
@@ -410,7 +408,7 @@ void loadRawModel(const char* filename, const char* filenameNorm, int start_idx)
         ss >> n.x >> n.y >> n.z;
 
         if (i < num_triangles) {
-            facetNorms[i] = n;
+            //facetNorms[i] = n;
             i++;
         }
         else {
