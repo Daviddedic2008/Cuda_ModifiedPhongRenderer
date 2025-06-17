@@ -20,3 +20,6 @@ depth mask of said model: ![image](https://github.com/user-attachments/assets/c3
 
 interpolated vertex norm map: ![image](https://github.com/user-attachments/assets/198da4c7-50f0-45a1-98cc-a25665945f4c)
 
+extra: ![Screenshot 2025-01-26 222209](https://github.com/user-attachments/assets/20418bc2-51d1-4583-a977-c196fbaedd33)
+
+
